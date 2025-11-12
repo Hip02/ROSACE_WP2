@@ -17,7 +17,7 @@ param = {
 
 dataLoader = MyDataLoader(root_dir=images_path, labels_file=labels_path, param=param)
 
-net = Network(dataLoader, results_path="./firstRun", param=param, epochs=3)
+net = Network(dataLoader, exp_name="firstRun", param=param, epochs=3)
 
 #net.visualize(mode="train")
 #net.train()

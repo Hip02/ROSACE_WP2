@@ -26,16 +26,16 @@ def create_folder(path: str):
 # 2. CLASSE ENTRAÎNEMENT/TEST
 # ========================
 class Network:
-    def __init__(self, dataLoader, param=None, results_path="./results", device="cpu", lr=1e-3, batch_size=16, epochs=5):
+    def __init__(self, dataLoader, param=None, exp_name="Unnamed", device="cpu", lr=1e-3, batch_size=16, epochs=5):
         set_seed(42)
         self.dataLoader = dataLoader
         self.device = device
         self.epochs = epochs
-        self.results_path = results_path
+        self.results_path = "exp_list/" + exp_name
         self.batchSize = batch_size
         self.lr = lr
         
-        create_folder(results_path)
+        create_folder(self.results_path)
 
         # Data Loaders
         self.dataSetTrain = LascoC2ImagesDataset(self.dataLoader, mode='train', param=param)
