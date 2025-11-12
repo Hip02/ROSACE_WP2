@@ -1,0 +1,28 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Dataset
+Dataset/
+
+# --- Données lourdes / modèles ---
+_Weights/
+*.h5
+*.ckpt
+*.pt
+*.pth
+*.npz
+*.npy
+*.mat
+*.hdf5
+*.tar
+*.gz
+*.zip
+*.pkl
