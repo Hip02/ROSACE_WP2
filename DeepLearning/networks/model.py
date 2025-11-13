@@ -323,8 +323,8 @@ class Network:
         for i, (ax, title) in enumerate(zip(axs, titles)):
             ax.scatter(labels[:, i], preds[:, i], alpha=0.6, s=15)
             ax.plot([labels[:, i].min(), labels[:, i].max()],
-                    [labels[:, i].min(), labels[:, i].max()],
-                    'r--', linewidth=1)
+                [labels[:, i].min(), labels[:, i].max()],
+                'r--', linewidth=1)
             ax.set_title(f"{title} — GT vs Pred", fontsize=10)
             ax.set_xlabel("GT")
             ax.set_ylabel("Predicted")
@@ -332,6 +332,14 @@ class Network:
 
         plt.suptitle("Scatter Plots of Predictions", fontsize=13, fontweight="bold")
         plt.tight_layout(rect=[0, 0, 1, 0.95])
+
+        # Save figure
+        out_dir = os.path.join(self.results_path, "visualizations")
+        os.makedirs(out_dir, exist_ok=True)
+        out_path = os.path.join(out_dir, "scatter_predictions.png")
+        fig.savefig(out_path, dpi=150)
+        print(f"💾 Scatter plot saved to: {out_path}")
+
         plt.show()
 
         # --- Inspection de plusieurs prédictions complètes ---

@@ -36,6 +36,7 @@ class LascoC2ImagesDataset(Dataset):
         self.param = param
 
         self.polar_transform = param.get("polar_transform", False) if param else False
+        self.shuffle = param.get("shuffle", True) if param else True
 
         # Trouver toutes les images PNG
         self.image_paths = sorted([
@@ -57,7 +58,9 @@ class LascoC2ImagesDataset(Dataset):
 
         # Split train/val/test
         indices = list(range(len(self.image_paths)))
-        random.shuffle(indices)
+
+        if self.shuffle:
+            random.shuffle(indices)
 
         n_total = len(indices)
         n_train = int(split_ratio[0] * n_total)
@@ -132,19 +135,29 @@ class LascoC2ImagesDataset(Dataset):
     def get_label_infos_from_cme_id(self, cme_id):
         """
         Retourne un label au format (has_cme, pa_deg, da_deg) à partir du CME_ID.
-        Si pas de CME, retourne (0.0, -1.0, -1.0).
+        Si pas de CME, retourne (0.0, 0.0, 0.0).
         """
         if cme_id == 0:
-            return torch.tensor([0.0, -1.0, -1.0], dtype=torch.float32)
+            return torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32)
 
         # Retrouver la CME correspondante
         match = next((cme for cme in self.cme_intervals if cme["id"] == cme_id), None)
         if match:
             pa_deg = match["pa_deg"]
+
+            # |───────────────────────────────────────────────────────────────|
+            # │ /!\  WARNING: Convention adjustment                           |
+            # │ This converts CACTus position angle (PA) to the warp_polar    |
+            # │ convention where 0° points to the right. Keep this shift.     |
+            # │ to ensure angles align with the polar transform.              |
+            # |───────────────────────────────────────────────────────────────|
+            pa_deg = (pa_deg - 90) % 360
+
+
             da_deg = match["da_deg"]
             return torch.tensor([1.0, pa_deg, da_deg], dtype=torch.float32)
         else:
-            return torch.tensor([0.0, -1.0, -1.0], dtype=torch.float32)
+            return torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32)
 
 
     def _apply_polar_transform(self, image_np):
@@ -179,6 +192,15 @@ class LascoC2ImagesDataset(Dataset):
 
     def __len__(self):
         return len(self.data_indices)
+
+    def get_datetime(self, idx):
+        """
+        Retourne la datetime exacte correspondant au sample idx,
+        en prenant en compte le split (train/val/test).
+        """
+        real_idx = self.data_indices[idx]
+        img_path = self.image_paths[real_idx]
+        return self._extract_datetime_from_filename(img_path)
 
 
     def __getitem__(self, idx):
