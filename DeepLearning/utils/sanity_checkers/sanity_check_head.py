@@ -15,6 +15,10 @@ def generate_polar_mask(pa_deg, aw_deg, H=363, W=360, thickness_ratio=0.4):
     - aw_deg : angular width en degrés
     """
 
+    # Cas particulier : pas de CME
+    if aw_deg <= 0:
+        return torch.zeros((1, 1, H, W), dtype=torch.float32)
+
     mask = torch.zeros((1, H, W), dtype=torch.float32)
 
     radial_thickness = int(H * thickness_ratio)
@@ -36,6 +40,24 @@ def generate_polar_mask(pa_deg, aw_deg, H=363, W=360, thickness_ratio=0.4):
     mask[:, radial_start:radial_end, cond] = 1.0
 
     return mask.unsqueeze(0)  # shape (1, 1, H, W)
+
+def add_noise_to_mask(mask, sigma=0.05):
+    """
+    Ajoute un bruit gaussien au masque (différentiable friendly).
+    mask: (1, 1, H, W)
+    sigma: écart-type du bruit (0.02–0.10 recommandé)
+
+    Retourne :
+        mask_bruite dans [0,1]
+    """
+    noise = torch.randn_like(mask) * sigma
+    mask_noisy = mask + noise
+
+    # Reforcer dans [0,1]
+    mask_noisy = mask_noisy.clamp(0.0, 1.0)
+
+    return mask_noisy
+
 
 
 # ===============================================================
@@ -83,7 +105,7 @@ def plot_aw(ax, pa, aw, color, label, fill=True):
 
 
 # ===============================================================
-# 3) Visualisation complète (option B)
+# 3) Visualisation complète (option B) — Version corrigée
 # ===============================================================
 def visualize_prediction(mask, pa_true, aw_true, pa_pred, aw_pred):
     """
@@ -92,6 +114,7 @@ def visualize_prediction(mask, pa_true, aw_true, pa_pred, aw_pred):
     - Profil angulaire
     - Comparaison PA
     - Comparaison AW (avec wrap 360°)
+    - Gestion correcte du cas AW=0 (pas de CME)
     """
 
     mask_np = mask.squeeze().cpu().numpy()
@@ -123,57 +146,63 @@ def visualize_prediction(mask, pa_true, aw_true, pa_pred, aw_pred):
     ax[1, 0].legend()
 
     # ---- (4) Angular Width Comparison ----
+    ax[1, 1].set_title("Angular Width Comparison")
 
-    # Recalcule les half-widths ici
+    # Recalcule les half-widths
     half_true = aw_true / 2
     half_pred = aw_pred / 2
 
     def aw_interval(pa, half):
+        """Retourne (start,end) modulo 360°."""
         a1 = (pa - half) % 360
         a2 = (pa + half) % 360
         return a1, a2
 
-    # AW TRUE (zone verte avec wrap)
-    a1_true, a2_true = aw_interval(pa_true, half_true)
+    # ============================================================
+    # AW TRUE (zone verte)
+    # ============================================================
+    if aw_true > 0:   # <--- correction clé
+        a1_true, a2_true = aw_interval(pa_true, half_true)
 
-    if a1_true < a2_true:
-        ax[1,1].axvspan(a1_true, a2_true,
-                        color="green", alpha=0.25,
-                        label="AW True")
-    else:
-        ax[1,1].axvspan(a1_true, 360,
-                        color="green", alpha=0.25,
-                        label="AW True")
-        ax[1,1].axvspan(0, a2_true,
-                        color="green", alpha=0.25)
+        if a1_true < a2_true:
+            ax[1,1].axvspan(a1_true, a2_true,
+                            color="green", alpha=0.25,
+                            label="AW True")
+        else:
+            ax[1,1].axvspan(a1_true, 360,
+                            color="green", alpha=0.25,
+                            label="AW True")
+            ax[1,1].axvspan(0, a2_true,
+                            color="green", alpha=0.25)
 
-    # AW PRED avec HACHURES (wrap géré aussi)
-    a1_pred, a2_pred = aw_interval(pa_pred, half_pred)
+    # ============================================================
+    # AW PRED (zone rouge hachurée)
+    # ============================================================
+    if aw_pred > 0:    # <--- correction identique
+        a1_pred, a2_pred = aw_interval(pa_pred, half_pred)
 
-    if a1_pred < a2_pred:
-        ax[1,1].axvspan(a1_pred, a2_pred,
-                        facecolor="none",
-                        edgecolor="red",
-                        hatch="//",
-                        linewidth=1.5,
-                        label="AW Pred")
-    else:
-        ax[1,1].axvspan(a1_pred, 360,
-                        facecolor="none",
-                        edgecolor="red",
-                        hatch="//",
-                        linewidth=1.5,
-                        label="AW Pred")
-        ax[1,1].axvspan(0, a2_pred,
-                        facecolor="none",
-                        edgecolor="red",
-                        hatch="//",
-                        linewidth=1.5)
+        if a1_pred < a2_pred:
+            ax[1,1].axvspan(a1_pred, a2_pred,
+                            facecolor="none",
+                            edgecolor="red",
+                            hatch="//",
+                            linewidth=1.5,
+                            label="AW Pred")
+        else:
+            ax[1,1].axvspan(a1_pred, 360,
+                            facecolor="none",
+                            edgecolor="red",
+                            hatch="//",
+                            linewidth=1.5,
+                            label="AW Pred")
+            ax[1,1].axvspan(0, a2_pred,
+                            facecolor="none",
+                            edgecolor="red",
+                            hatch="//",
+                            linewidth=1.5)
 
-    ax[1,1].set_title("Angular Width Comparison")
     ax[1,1].set_xlim(0, 360)
     ax[1,1].legend()
-
 
     plt.tight_layout()
     plt.show()
@@ -191,12 +220,21 @@ class CMEHeadChecker:
     # -------------------------------
     # Test d'un cas unique
     # -------------------------------
-    def test(self, pa, aw):
+    def test(self, pa, aw, noise_sigma=0.0):
+        """
+        Test d’un cas unique, avec option d’ajout de bruit.
+        """
         mask = generate_polar_mask(pa_deg=pa, aw_deg=aw,
-                                   H=self.H, W=self.W)
+                                H=self.H, W=self.W)
+
+        # Appliquer le bruit si demandé
+        if noise_sigma > 0:
+            mask_eval = add_noise_to_mask(mask, sigma=noise_sigma)
+        else:
+            mask_eval = mask
 
         with torch.no_grad():
-            out = self.head(mask)
+            out = self.head(mask_eval)
             has_cme, pa_pred, aw_pred = out[0]
 
         has_cme = float(has_cme)
@@ -207,9 +245,14 @@ class CMEHeadChecker:
         print(f"PA True = {pa:6.2f}°   | PA Pred = {pa_pred:6.2f}°")
         print(f"AW True = {aw:6.2f}°   | AW Pred = {aw_pred:6.2f}°")
         print(f"has_cme_pred = {has_cme:.4f}")
+        if noise_sigma > 0:
+            print(f"(Noise applied: σ = {noise_sigma})")
         print()
 
-        visualize_prediction(mask.squeeze(0), pa, aw, pa_pred, aw_pred)
+        visualize_prediction(mask_eval.squeeze(0),
+                            pa, aw,
+                            pa_pred, aw_pred)
+
 
     # -------------------------------
     # Tests standards
@@ -221,6 +264,13 @@ class CMEHeadChecker:
         ]
         for pa, aw in tests:
             self.test(pa, aw)
+    
+    def test_noisy(self):
+        tests = [
+            (90, 60)
+        ]
+        for pa, aw in tests:
+            self.test(pa, aw, noise_sigma=0.05)
 
     def test_extremes(self):
         tests = [(0, 30), (90, 30), (180, 30), (270, 30)]

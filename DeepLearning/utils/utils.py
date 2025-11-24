@@ -28,54 +28,75 @@ class LascoC2ImagesDataset(Dataset):
     Divise le dataset en train / val / test de manière aléatoire mais reproductible.
     """
 
-    def __init__(self, dataloader, mode="train", param=None, split_ratio=(0.8, 0.1, 0.1), seed=42):
-        assert mode in ["train", "val", "test"], "mode doit être 'train', 'val' ou 'test'"
+    def __init__(self, dataloader, mode="train", param=None, 
+                 split_ratio=(0.8, 0.1, 0.1), seed=42):
+
+        assert mode in ["train", "val", "test"]
+
         self.root_dir = dataloader.get_root_dir()
         self.labels_file = dataloader.get_labels_file()
         self.mode = mode
-        self.param = param
+        self.param = param or {}
+        self.polar_transform = self.param.get("polar_transform", False)
+        self.shuffle = self.param.get("shuffle", True)
+        self.subsampling_factor = param.get("subsampling_factor", 1) if param else 1
+        self.use_neighbor_diff = self.param.get("use_neighbor_diff", False)
 
-        self.polar_transform = param.get("polar_transform", False) if param else False
-        self.shuffle = param.get("shuffle", True) if param else True
-
-        # Trouver toutes les images PNG
+        # -------------------------------------------------------
+        # 1) Charger toutes les images et extraire leur datetime
+        # -------------------------------------------------------
         self.image_paths = sorted([
             os.path.join(self.root_dir, f)
             for f in os.listdir(self.root_dir)
             if f.endswith(".png")
         ])
+
         if len(self.image_paths) == 0:
             raise ValueError(f"Aucune image PNG trouvée dans {self.root_dir}")
 
-        # Reproductibilité pour le split
         random.seed(seed)
         np.random.seed(seed)
 
-        # Charger les infos CME depuis le CSV
         self.cme_df = pd.read_csv(self.labels_file)
         self.cme_intervals = self._load_cme_intervals()
         self.labels_dict = self._create_labels_mapping(self.image_paths, self.cme_intervals)
 
-        # Split train/val/test
-        indices = list(range(len(self.image_paths)))
+        # --- extraction des timestamps pour chaque image ---
+        self.image_times = [
+            self._extract_datetime_from_filename(p)
+            for p in self.image_paths
+        ]
 
+        # -------------------------------------------------------
+        # 2) Construire indices triés par temps → pour adjacence t-1, t+1
+        # -------------------------------------------------------
+        self.sorted_indices_by_time = sorted(range(len(self.image_paths)),
+                                             key=lambda i: self.image_times[i])
+
+        # -------------------------------------------------------
+        # 3) Split train/val/test (sur index mélangé si shuffle=True)
+        # -------------------------------------------------------
+        all_indices = list(range(len(self.image_paths)))
         if self.shuffle:
-            random.shuffle(indices)
+            random.shuffle(all_indices)
 
-        n_total = len(indices)
+        n_total = len(all_indices)
         n_train = int(split_ratio[0] * n_total)
         n_val = int(split_ratio[1] * n_total)
 
-        train_indices = indices[:n_train]
-        val_indices = indices[n_train:n_train + n_val]
-        test_indices = indices[n_train + n_val:]
+        train_idx = all_indices[:n_train]
+        val_idx = all_indices[n_train:n_train+n_val]
+        test_idx = all_indices[n_train+n_val:]
 
         if mode == "train":
-            self.data_indices = train_indices
+            self.data_indices = train_idx
+            ########## Subsampling si demandé ##########
+            self.data_indices = self.data_indices[::self.subsampling_factor]
+
         elif mode == "val":
-            self.data_indices = val_indices
+            self.data_indices = val_idx
         else:
-            self.data_indices = test_indices
+            self.data_indices = test_idx
 
 
     def _load_cme_intervals(self):
@@ -112,24 +133,61 @@ class LascoC2ImagesDataset(Dataset):
 
 
     def _create_labels_mapping(self, image_paths, cme_intervals):
-        """Crée un dictionnaire image_name → CME_ID (ou 0 si aucune CME)."""
+        """
+        Retourne un dict:
+            image_name -> [ {pa, da}, {pa, da}, ... ]  (liste de CME actives)
+        La liste peut être de taille 0, 1, 2, 3, ...
+        """
         labels_dict = {}
 
         for img_path in image_paths:
+            img_name = os.path.basename(img_path)
             img_time = self._extract_datetime_from_filename(img_path)
+
             if img_time is None:
-                labels_dict[os.path.basename(img_path)] = 0
+                labels_dict[img_name] = []
                 continue
 
-            cme_id = 0
+            # Liste dynamique, aucune limite sur le nombre
+            active = []
             for cme in cme_intervals:
                 if cme["start"] <= img_time <= cme["end"]:
-                    cme_id = cme["id"]
-                    break
+                    active.append({
+                        "pa_deg": cme["pa_deg"],
+                        "da_deg": cme["da_deg"]
+                    })
 
-            labels_dict[os.path.basename(img_path)] = cme_id
+            labels_dict[img_name] = active
 
         return labels_dict
+
+
+    def _build_angular_constraints(self, active_cmes):
+        """
+        Liste dynamique de contraintes, une par CME active.
+        ex: [
+            {"theta_min":..., "theta_max":..., "pa":..., "da":...},
+            ...
+        ]
+        """
+        constraints = []
+
+        for cme in active_cmes:
+            pa = (cme["pa_deg"] - 90) % 360
+            da = cme["da_deg"]
+
+            theta_min = (pa - da/2) % 360
+            theta_max = (pa + da/2) % 360
+
+            constraints.append({
+                "theta_min": theta_min,
+                "theta_max": theta_max,
+                "pa": pa,
+                "da": da
+            })
+
+        return constraints
+
 
 
     def get_label_infos_from_cme_id(self, cme_id):
@@ -160,34 +218,31 @@ class LascoC2ImagesDataset(Dataset):
             return torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32)
 
 
-    def _apply_polar_transform(self, image_np):
+    def _apply_polar_transform(self, image_np, n_radial=360, n_theta=360):
         """
         Transforme une image 2D (numpy array) en coordonnées polaires.
-        - r : distance radiale depuis le centre
-        - theta : angle azimutal (0–360°)
         """
-        # Calcul du centre de l’image
+        # Calcul du centre
         center = (image_np.shape[0] / 2, image_np.shape[1] / 2)
-        # Rayon maximal (jusqu’aux coins)
         radius = np.hypot(center[0], center[1])
 
-        # Transformation cartésienne → polaire
+        # IMPORTANT : on impose explicitement le shape (r, theta)
         polar_image = warp_polar(
             image_np,
             center=center,
             radius=radius,
-            scaling='linear',   # conserve les distances radiales réelles
-            output_shape=None   # auto
+            scaling='linear',
+            output_shape=(n_radial, n_theta)
         )
 
-        # On permute les axes pour avoir l'angle sur l'axe X
-        polar_image = np.transpose(polar_image)  # (r, θ) -> (θ, r)
-        polar_image = np.flipud(polar_image)      # inverse l'axe vertical (r croît vers le bas)
+        # On permute pour avoir (theta, r)
+        polar_image = np.transpose(polar_image)   # shape → [n_theta, n_radial]
+        polar_image = np.flipud(polar_image)
 
-        # Normalisation entre 0 et 1
+        # Normalisation [0,1]
         polar_image = np.clip(polar_image, 0.0, 1.0)
-
         return polar_image
+
 
 
     def __len__(self):
@@ -202,25 +257,70 @@ class LascoC2ImagesDataset(Dataset):
         img_path = self.image_paths[real_idx]
         return self._extract_datetime_from_filename(img_path)
 
-
-    def __getitem__(self, idx):
-        real_idx = self.data_indices[idx]
-        img_path = self.image_paths[real_idx]
-
-        # Charger l'image en niveau de gris
-        image = Image.open(img_path).convert("L")
+    def _load_polar_tensor(self, path):
+        image = Image.open(path).convert("L")
         image_np = np.array(image, dtype=np.float32) / 255.0
 
-        # Si la transformation polaire est activée
         if self.polar_transform:
             image_np = self._apply_polar_transform(image_np)
 
-        # Conversion en tensor [1, H, W]
-        image = torch.tensor(image_np, dtype=torch.float32).unsqueeze(0)
+        return torch.tensor(image_np, dtype=torch.float32).unsqueeze(0)   # [1,H,W]
 
-        # Récupérer le label
+    # =====================================================================
+    #                               GETITEM
+    # =====================================================================
+    def __getitem__(self, idx):
+        # real index dans image_paths
+        real_idx = self.data_indices[idx]
+        img_path = self.image_paths[real_idx]
+
+        # Charger image t
+        I_t = self._load_polar_tensor(img_path)
+
+        # -----------------------------------------------------
+        # Trouver t-1 et t+1 dans **la liste triée par temps**
+        # -----------------------------------------------------
+        sorted_pos = self.sorted_indices_by_time.index(real_idx)
+
+        # voisin t-1
+        if sorted_pos > 0:
+            idx_prev = self.sorted_indices_by_time[sorted_pos - 1]
+            I_prev = self._load_polar_tensor(self.image_paths[idx_prev])
+        else:
+            I_prev = torch.zeros_like(I_t)
+
+        # voisin t+1
+        if sorted_pos < len(self.sorted_indices_by_time) - 1:
+            idx_next = self.sorted_indices_by_time[sorted_pos + 1]
+            I_next = self._load_polar_tensor(self.image_paths[idx_next])
+        else:
+            I_next = torch.zeros_like(I_t)
+
+        # -----------------------------------------------------
+        # Images différentielles
+        # -----------------------------------------------------
+        dI_prev = I_t - I_prev
+        dI_next = I_next - I_t
+
+        if self.use_neighbor_diff:
+            # Stack final : [5,H,W]
+            img_stack = torch.cat([I_prev, I_t, I_next, dI_prev, dI_next], dim=0)
+        else:
+            # Stack final : [1,H,W]
+            img_stack = I_t
+
+        # -----------------------------------------------------
+        # Labels / constraints
+        # -----------------------------------------------------
         img_name = os.path.basename(img_path)
-        cme_id = self.labels_dict.get(img_name, 0)
-        label = self.get_label_infos_from_cme_id(cme_id)
+        active_cmes = self.labels_dict.get(img_name, [])
+        constraints = self._build_angular_constraints(active_cmes)
 
-        return image, label
+        t_frame = self._extract_datetime_from_filename(img_path)
+
+        return {
+            "image": img_stack,            # [5, H, W] ou [1, H, W] si pas de voisins
+            "constraints": constraints,  # liste dynamique selon CME actives
+            "time": t_frame
+        }
+

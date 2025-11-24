@@ -9,7 +9,7 @@ import os
 import random
 import math
 from datetime import datetime
-from networks.architectures.network_1 import CMESegNet
+from networks.architectures.network_1 import CMESegNet, WeakCMECompositeLoss, WeakCMEUNet, CMELoss2
 
 # ========================
 # 1. UTILITAIRES
@@ -22,18 +22,39 @@ def create_folder(path: str):
     if not os.path.exists(path):
         os.makedirs(path)
 
+def weak_collate(batch):
+    """
+    batch = list of samples:
+        {
+            "image": Tensor[1,H,W],
+            "constraints": list[dict],
+            "time": datetime
+        }
+    """
+    images = torch.stack([item["image"] for item in batch], dim=0)
+    constraints = [item["constraints"] for item in batch]  # PAS empilé
+    times = [item["time"] for item in batch]
+
+    return {
+        "image": images,           # Tensor[B,1,H,W]
+        "constraints": constraints, # list-of-lists, intact
+        "time": times
+    }
+
+
 # ========================
 # 2. CLASSE ENTRAÎNEMENT/TEST
 # ========================
 class Network:
-    def __init__(self, dataLoader, param=None, exp_name="Unnamed", device="cpu", lr=1e-3, batch_size=16, epochs=5):
+    def __init__(self, dataLoader, param=None, exp_name="Unnamed", device="cpu", batch_size=16, epochs=5):
         set_seed(42)
         self.dataLoader = dataLoader
         self.device = device
         self.epochs = epochs
         self.results_path = "exp_list/" + exp_name
         self.batchSize = batch_size
-        self.lr = lr
+        self.lr = param.get("lr", 1e-3) if param is not None else 1e-3
+        self.use_neighbors_diff = param.get("use_neighbor_diff", False) if param is not None else False
         
         create_folder(self.results_path)
 
@@ -42,19 +63,18 @@ class Network:
         self.dataSetVal = LascoC2ImagesDataset(self.dataLoader, mode='val', param=param)
         self.dataSetTest = LascoC2ImagesDataset(self.dataLoader, mode='test', param=param)
 
-        self.trainDataLoader = DataLoader(self.dataSetTrain, batch_size=self.batchSize, shuffle=True, num_workers=0)
-        self.valDataLoader = DataLoader(self.dataSetVal, batch_size=self.batchSize, shuffle=False, num_workers=0)
-        self.testDataLoader = DataLoader(self.dataSetTest, batch_size=self.batchSize, shuffle=False, num_workers=0)
-
-        for X, y in self.trainDataLoader:
-            print("Train data loader X shape:", X.shape)
-            print("Train data loader Y shape::", y.shape)
-            break
+        self.trainDataLoader = DataLoader(self.dataSetTrain, batch_size=self.batchSize, shuffle=True, collate_fn=weak_collate, num_workers=0)
+        self.valDataLoader = DataLoader(self.dataSetVal, batch_size=self.batchSize, shuffle=False, collate_fn=weak_collate, num_workers=0)
+        self.testDataLoader = DataLoader(self.dataSetTest, batch_size=self.batchSize, shuffle=False, collate_fn=weak_collate, num_workers=0)
 
         # Model + Optimizer + Loss
-        self.model = CMESegNet(in_channels=1).to(device)
-        self.criterion = nn.MSELoss()
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
+
+        self.in_channels = 5 if self.use_neighbors_diff else 1
+
+        self.model = WeakCMEUNet(in_channels=self.in_channels).to(device)
+        self.criterion = CMELoss2().to(device)
+        #self.criterion = WeakCMECompositeLoss(n_bins=360, param=param).to(device)
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
 
     def train(self):
         train_losses, val_losses = [], []
@@ -63,14 +83,30 @@ class Network:
             self.model.train()
             running_loss = 0.0
 
-            for X, y in tqdm(self.trainDataLoader, desc=f"Epoch {epoch+1}/{self.epochs}"):
-                X, y = X.to(self.device), y.to(self.device)
+            for batch in tqdm(self.trainDataLoader, desc=f"Epoch {epoch+1}/{self.epochs}"):
+
+                # Batch extraction
+                X = batch["image"].to(self.device)             # [B,1,R,Theta]
+                constraints_batch = batch["constraints"]       # list of lists (CPU OK)
+
                 self.optimizer.zero_grad()
-                mask_pred, outputs = self.model(X)
-                loss = self.criterion(outputs, y)
+
+                # Forward UNet
+                mask_pred = self.model(X)                   # mask_pred: [B,1,R,Theta]
+
+                # Compute weak loss
+                loss, loss_dict = self.criterion(
+                    mask_pred,
+                    constraints_batch,
+                    X
+                )
+
+                # Backpropagation
                 loss.backward()
                 self.optimizer.step()
+
                 running_loss += loss.item() * X.size(0)
+
 
             mean_train_loss = running_loss / len(self.trainDataLoader.dataset)
             train_losses.append(mean_train_loss)
@@ -120,253 +156,295 @@ class Network:
             print(f"⚠️ Erreur lors du chargement des poids: {e}")
     
 
-    def visualize(self, n_samples=16, mode="train", save=False):
+    def visualize_samples(self, n_samples=20, mode="train"):
         """
-        Affiche une grille 4x4 d'images du dataset choisi (train/val/test)
-        avec les 3 infos du label : has_cme, pa_deg, da_deg, et la date de l'image.
+        Sauvegarde n_samples figures dans exp/data_visualize.
+        Chaque figure contient les 5 images (t-1, t, t+1, Δ1, Δ2)
+        avec les overlays CME comme dans les sanity checks.
         """
 
-        assert mode in ["train", "val", "test"], "mode doit être 'train', 'val' ou 'test'"
+        assert mode in ["train", "val", "test"]
 
-        # Sélection du dataset
-        if mode == "train":
-            dataset = self.dataSetTrain
-        elif mode == "val":
-            dataset = self.dataSetVal
-        else:
-            dataset = self.dataSetTest
+        # Sélection dataset
+        dataset = {
+            "train": self.dataSetTrain,
+            "val": self.dataSetVal,
+            "test": self.dataSetTest,
+        }[mode]
+
+        # Dossier output
+        out_dir = os.path.join(self.results_path, "data_visualize")
+        os.makedirs(out_dir, exist_ok=True)
 
         n_samples = min(n_samples, len(dataset))
+
+        # Tirage aléatoire
+        import random
         rng = random.Random()
         indices = rng.sample(range(len(dataset)), n_samples)
 
-        n_cols = 4
-        n_rows = (n_samples + n_cols - 1) // n_cols
-        fig, axes = plt.subplots(n_rows, n_cols, figsize=(12, 12))
-        axes = axes.flatten()
+        # TITRES
+        channel_titles = ["t-1", "t", "t+1", "Δ1", "Δ2"]
 
-        for ax, idx in zip(axes, indices):
-            # On suppose que le dataset renvoie (image, label)
-            image, label = dataset[idx]
-            has_cme, pa_deg, da_deg = label.tolist()
+        for fig_id, idx in enumerate(indices):
 
-            # Extraire la date à partir du nom de fichier
-            img_path = dataset.image_paths[dataset.data_indices[idx]]
-            filename = os.path.basename(img_path)
+            sample = dataset[idx]
+            img_stack = sample["image"]            # (C,H,W)
+            constraints = sample["constraints"]    # liste de CME
+            time = sample["time"]                  # timestamp éventuel
 
-            try:
-                parts = filename.split("_")
-                date_str = f"{parts[1]}-{parts[2]}-{parts[3]} {parts[4]}:{parts[5]}:{parts[6].split('.')[0]}"
-                date = datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S")
-                date_label = date.strftime("%Y-%m-%d %H:%M:%S")
-            except Exception:
-                date_label = "unknown date"
+            C, H, W = img_stack.shape
 
-            # Image
-            img_np = image.squeeze().numpy()
-            ax.imshow(img_np, cmap='gray', vmin=0, vmax=1)
-            ax.axis("off")
+            # CME overlay
+            has_cme = len(constraints) > 0
+            if has_cme:
+                theta_min = constraints[0]["theta_min"]
+                theta_max = constraints[0]["theta_max"]
+                pa = constraints[0]["pa"]
+                da = constraints[0]["da"]
+            else:
+                theta_min = theta_max = None
+                pa = da = 0.0
 
-            # Couleur selon présence de CME
-            color = "lime" if has_cme > 0.5 else "gray"
+            # Couleur du cadre
+            frame_color = "lime" if has_cme else "gray"
 
-            # Titre formaté proprement
-            ax.set_title(
-                f"has_cme: {int(has_cme)}\n"
-                f"pa: {pa_deg:.1f}° | da: {da_deg:.1f}°\n"
-                f"{date_label}",
-                fontsize=8.5,
-                color=color,
+            # Créer figure
+            fig, axes = plt.subplots(
+                1, 5,
+                figsize=(20, 4),
+                squeeze=False
+            )
+            axes = axes[0]
+
+            # ----------------------------------------------------
+            # AFFICHAGE des 5 IMAGES avec OVERLAY CME
+            # ----------------------------------------------------
+            for k in range(5):
+                ax = axes[k]
+                img = img_stack[k].numpy()
+
+                ax.imshow(img, cmap="gray", vmin=0, vmax=1)
+
+                # Overlay CME si elle existe
+                if has_cme:
+                    # masque transparent
+                    overlay = np.zeros((H, W, 4))      # RGBA
+
+                    # range angulaire
+                    tmin = int(theta_min) % W
+                    tmax = int(theta_max) % W
+
+                    if tmin <= tmax:
+                        overlay[:, tmin:tmax, 1] = 1.0   # canal G = 1
+                        overlay[:, tmin:tmax, 3] = 0.25  # alpha
+                    else:
+                        # cas θ_min > θ_max (wrap around)
+                        overlay[:, tmin:, 1] = 1.0
+                        overlay[:, tmin:, 3] = 0.25
+                        overlay[:, :tmax, 1] = 1.0
+                        overlay[:, :tmax, 3] = 0.25
+
+                    ax.imshow(overlay)
+
+                ax.set_title(channel_titles[k], fontsize=10, color=frame_color)
+                ax.axis("off")
+
+                # Bordure
+                for spine in ax.spines.values():
+                    spine.set_edgecolor(frame_color)
+                    spine.set_linewidth(2)
+
+            # ----------------------------------------------------
+            # TITRE GLOBAL
+            # ----------------------------------------------------
+            fig.suptitle(
+                f"Sample {fig_id:03d} | CME={int(has_cme)} | pa={pa:.1f}° | da={da:.1f}° | t={time}",
+                fontsize=14,
                 fontweight="bold",
-                linespacing=1.2
+                color=frame_color
             )
 
-            # Bordure colorée
-            for spine in ax.spines.values():
-                spine.set_edgecolor(color)
-                spine.set_linewidth(2)
+            fig.tight_layout(rect=[0, 0, 1, 0.92])
 
-        # Cacher les cases vides si < 16
-        for ax in axes[n_samples:]:
-            ax.axis("off")
+            # ----------------------------------------------------
+            # SAVE only
+            # ----------------------------------------------------
+            out_path = os.path.join(out_dir, f"sample_{fig_id:03d}.png")
+            fig.savefig(out_path, dpi=120)
+            plt.close(fig)
 
-        plt.suptitle(f"LASCO C2 samples ({mode} set)", fontsize=14, fontweight="bold")
-        plt.tight_layout(rect=[0, 0, 1, 0.96])
-
-        if save:
-            out_dir = os.path.join(self.results_path, "visualizations")
-            os.makedirs(out_dir, exist_ok=True)
-            out_path = os.path.join(out_dir, f"sample_grid_{mode}.png")
-            plt.savefig(out_path, dpi=150)
-            print(f"💾 Visualization saved to: {out_path}")
-
-        plt.show()
 
     def validate(self):
         self.model.eval()
         total_loss = 0
+
         with torch.no_grad():
-            for X, y in self.valDataLoader:
-                X, y = X.to(self.device), y.to(self.device)
-                mask_pred, outputs = self.model(X)
-                loss = self.criterion(outputs, y)
+            # barre de chargement validation
+            val_loader = tqdm(
+                self.valDataLoader,
+                desc="Validating",
+                colour="cyan"  # ou "magenta", "green", "#00FFFF", ...
+            )
+
+            for batch in val_loader:
+                X = batch["image"].to(self.device)
+                constraints_batch = batch["constraints"]
+
+                mask_pred = self.model(X)
+
+                loss, loss_dict = self.criterion(
+                    mask_pred,
+                    constraints_batch,
+                    X
+                )
+
                 total_loss += loss.item() * X.size(0)
+
         return total_loss / len(self.valDataLoader.dataset)
+
 
     def test(self, n_samples=16, save_vis=True, n_inspect=3):
         """
-        Évalue le modèle sur le test set :
-        (1) Calcule les MSE des 3 paramètres (has_cme, pa_deg, da_deg)
-        (2) Visualise pour plusieurs exemples (image + masque)
-        (3) Inspecte n_inspect prédictions complètes (masques + valeurs)
-        (4) Trace des nuages de points GT vs PR pour évaluer la distribution des prédictions
+        Test weak-supervised segmentation model on polaire LASCO images.
+
+        Includes:
+        - visualizations
+        - mask statistics (collapse detection)
         """
 
         self.model.eval()
-        total_loss = 0
-        all_preds, all_labels = [], []
+        all_losses = []
 
-        # --- Évaluation quantitative ---
-        with torch.no_grad():
-            for X, y in tqdm(self.testDataLoader, desc="Testing"):
-                X, y = X.to(self.device), y.to(self.device)
-                mask_pred, outputs = self.model(X)
-                loss = self.criterion(outputs, y)
-                total_loss += loss.item() * X.size(0)
-                all_preds.append(outputs.cpu())
-                all_labels.append(y.cpu())
-
-        preds = torch.cat(all_preds, dim=0)
-        labels = torch.cat(all_labels, dim=0)
-
-        mse_has = torch.mean((preds[:, 0] - labels[:, 0]) ** 2).item()
-        mse_pa  = torch.mean((preds[:, 1] - labels[:, 1]) ** 2).item()
-        mse_da  = torch.mean((preds[:, 2] - labels[:, 2]) ** 2).item()
-        total_mse = (mse_has + mse_pa + mse_da) / 3
-
-        print(f"\n📏 Test results:")
-        print(f" - MSE has_cme : {mse_has:.4f}")
-        print(f" - MSE pa_deg  : {mse_pa:.4f}")
-        print(f" - MSE da_deg  : {mse_da:.4f}")
-        print(f" - Mean MSE     : {total_mse:.4f}\n")
-
-        # --- Visualisation qualitative : images et masques ---
-        n_samples = min(n_samples, len(self.dataSetTest))
-        indices = random.sample(range(len(self.dataSetTest)), n_samples)
-
-        n_cols_pairs = 4
-        n_rows = math.ceil(n_samples / n_cols_pairs)
-        n_cols = n_cols_pairs * 2
-
-        fig, axes = plt.subplots(n_rows, n_cols, figsize=(3.6 * n_cols_pairs, 3.1 * n_rows))
-        axes = axes.flatten()
-        im_ref = None
-
-        for i, idx in enumerate(indices):
-            X, y = self.dataSetTest[idx]
-            X = X.unsqueeze(0).to(self.device)
-
-            with torch.no_grad():
-                mask_pred, outputs = self.model(X)
-
-            image = X.squeeze().cpu().numpy()
-            mask_pred = mask_pred.squeeze().cpu().numpy()
-            has_cme_true, pa_true, da_true = y.tolist()
-            has_cme_pred, pa_pred, da_pred = outputs.squeeze().cpu().tolist()
-
-            # Image originale
-            ax_img = axes[2 * i]
-            ax_img.imshow(image, cmap='gray', vmin=0, vmax=1)
-            ax_img.set_title(
-                f"GT → has={has_cme_true:.1f}\npa={pa_true:.0f}°, da={da_true:.0f}°",
-                fontsize=8.5, color="white", backgroundcolor="black", pad=2
-            )
-            ax_img.axis("off")
-            for spine in ax_img.spines.values():
-                spine.set_edgecolor("white")
-                spine.set_linewidth(1.2)
-
-            # Masque prédit
-            ax_mask = axes[2 * i + 1]
-            im_ref = ax_mask.imshow(mask_pred, cmap="magma_r")
-            ax_mask.set_title(
-                f"PR → has={has_cme_pred:.1f}\npa={pa_pred:.0f}°, da={da_pred:.0f}°",
-                fontsize=8.5, color="white", backgroundcolor="black", pad=2
-            )
-            ax_mask.axis("off")
-            for spine in ax_mask.spines.values():
-                spine.set_edgecolor("white")
-                spine.set_linewidth(1.2)
-
-        for ax in axes[2 * n_samples:]:
-            ax.axis("off")
-
-        if im_ref is not None:
-            cbar_ax = fig.add_axes([0.92, 0.15, 0.015, 0.7])
-            fig.colorbar(im_ref, cax=cbar_ax, label="Predicted CME Mask Intensity")
-
-        plt.suptitle("CME Mask Predictions — Test Set", fontsize=14, fontweight="bold")
-        plt.tight_layout(rect=[0, 0, 0.9, 0.96])
-
-        if save_vis:
-            out_dir = os.path.join(self.results_path, "visualizations")
-            os.makedirs(out_dir, exist_ok=True)
-            out_path = os.path.join(out_dir, "test_predictions_grid.png")
-            plt.savefig(out_path, dpi=150)
-            print(f"💾 Visualization saved to: {out_path}")
-
-        plt.show()
-
-        # --- Scatter plots : corrélation GT ↔ PR ---
-        fig, axs = plt.subplots(1, 3, figsize=(12, 4))
-        titles = ["has_cme", "pa_deg", "da_deg"]
-        for i, (ax, title) in enumerate(zip(axs, titles)):
-            ax.scatter(labels[:, i], preds[:, i], alpha=0.6, s=15)
-            ax.plot([labels[:, i].min(), labels[:, i].max()],
-                [labels[:, i].min(), labels[:, i].max()],
-                'r--', linewidth=1)
-            ax.set_title(f"{title} — GT vs Pred", fontsize=10)
-            ax.set_xlabel("GT")
-            ax.set_ylabel("Predicted")
-            ax.grid(alpha=0.3)
-
-        plt.suptitle("Scatter Plots of Predictions", fontsize=13, fontweight="bold")
-        plt.tight_layout(rect=[0, 0, 1, 0.95])
-
-        # Save figure
-        out_dir = os.path.join(self.results_path, "visualizations")
-        os.makedirs(out_dir, exist_ok=True)
-        out_path = os.path.join(out_dir, "scatter_predictions.png")
-        fig.savefig(out_path, dpi=150)
-        print(f"💾 Scatter plot saved to: {out_path}")
-
-        plt.show()
-
-        # --- Inspection de plusieurs prédictions complètes ---
-        print("\n🔍 Detailed inspection of several predictions:")
-        inspect_indices = random.sample(range(len(self.dataSetTest)), n_inspect)
-        np.set_printoptions(precision=4, suppress=True, linewidth=150)
-
-        for idx_inspect in inspect_indices:
-            X, y = self.dataSetTest[idx_inspect]
-            X = X.unsqueeze(0).to(self.device)
-            with torch.no_grad():
-                mask_pred, outputs = self.model(X)
-
-            mask_np = mask_pred.squeeze().cpu().numpy()
-            has_cme_pred, pa_pred, da_pred = outputs.squeeze().cpu().tolist()
-            has_cme_true, pa_true, da_true = y.tolist()
-
-            print(f"\n--- Sample {idx_inspect} ---")
-            print(f"GT → has={has_cme_true:.3f}, pa={pa_true:.2f}°, da={da_true:.2f}°")
-            print(f"PR → has={has_cme_pred:.3f}, pa={pa_pred:.2f}°, da={da_pred:.2f}°")
-            print(f"Mask shape: {mask_np.shape}")
-            print(f"Mask min: {mask_np.min():.5f} | max: {mask_np.max():.5f} | mean: {mask_np.mean():.5f}")
-            print(mask_np)
-
-        return {
-            "mse_has": mse_has,
-            "mse_pa": mse_pa,
-            "mse_da": mse_da,
-            "mean_mse": total_mse
+        # NEW: global mask stats
+        mask_stats = {
+            "mean": [],
+            "std": [],
+            "min": [],
+            "max": [],
+            "active_pct": [],
+            "angular_var": [],
+            "mask_distance": []   # L1 distance between successive masks
         }
+
+        last_mask = None  # for collapse detection
+
+        # Directory for visualizations
+        vis_dir = os.path.join(self.results_path, "visualizations")
+        if save_vis:
+            os.makedirs(vis_dir, exist_ok=True)
+
+        # ----------------------------
+        # Collect n_samples from test set
+        # ----------------------------
+        samples = []
+        for i, batch in enumerate(self.testDataLoader):
+            for j in range(batch["image"].size(0)):
+                samples.append({
+                    "image": batch["image"][j:j+1],           # [1,1,R,Θ]
+                    "constraints": batch["constraints"][j],
+                    "time": batch["time"][j]
+                })
+                if len(samples) >= n_samples:
+                    break
+            if len(samples) >= n_samples:
+                break
+
+        # ----------------------------
+        # Loop through collected samples
+        # ----------------------------
+        with torch.no_grad():
+            for i, sample in enumerate(samples):
+
+                X = sample["image"].to(self.device)          # [1,1,R,Θ]
+                constraints = [sample["constraints"]]        # batch size 1
+
+                # ---- Forward ----
+                mask_pred = self.model(X)
+                loss, loss_dict = self.criterion(mask_pred, constraints, X)
+                all_losses.append(loss.item())
+
+                mask_np = mask_pred[0,0].cpu().numpy()       # [R,Θ]
+
+                # ---- Angular profile ----
+                A = mask_np.mean(axis=0)                     # [Θ]
+                target = self.criterion.build_target(constraints[0], device="cpu").numpy()
+
+                # ----------------------------
+                # 💠 MASK STATISTICS
+                # ----------------------------
+                mask_stats["mean"].append(mask_np.mean())
+                mask_stats["std"].append(mask_np.std())
+                mask_stats["min"].append(mask_np.min())
+                mask_stats["max"].append(mask_np.max())
+
+                # % pixels actifs (seuil arbitrary = 0.2)
+                active = (mask_np > 0.2).mean()
+                mask_stats["active_pct"].append(active)
+
+                # Angular variance (si très faible → collapse)
+                ang_var = np.var(A)
+                mask_stats["angular_var"].append(ang_var)
+
+                # Distance to previous mask (L1)
+                if last_mask is not None:
+                    dist = np.mean(np.abs(mask_np - last_mask))
+                    mask_stats["mask_distance"].append(dist)
+                last_mask = mask_np.copy()
+
+                # ----------------------------
+                # VISUALISATIONS
+                # ----------------------------
+                if i < n_inspect or save_vis:
+                    fig, axs = plt.subplots(3, 1, figsize=(10, 10))
+
+                    # 1. Image polaire brute
+                    axs[0].imshow(X[0,0].cpu(), cmap="gray", aspect="auto")
+                    axs[0].set_title(f"Image polaire — {sample['time']}")
+
+                    # 2. Masque prédit
+                    axs[1].imshow(mask_np, cmap="inferno", aspect="auto")
+                    axs[1].set_title("Masque prédit")
+
+                    # 3. Profil angulaire
+                    axs[2].plot(A, label="A(theta) prédiction")
+                    axs[2].plot(target, label="target(theta)", linestyle="--")
+                    axs[2].set_title("Profil angulaire (prédiction vs cible)")
+                    axs[2].set_xlabel("Angle (°)")
+                    axs[2].legend()
+
+                    plt.tight_layout()
+
+                    if save_vis:
+                        fname = os.path.join(vis_dir, f"inspect_{i:03d}.png")
+                        fig.savefig(fname, dpi=150)
+
+                    plt.close(fig)
+
+        # ----------------------------
+        # Résultat global du test
+        # ----------------------------
+        mean_test_loss = np.mean(all_losses)
+
+        print("\n🎯 Test terminé")
+        print(f"   ➤ Test Loss = {mean_test_loss:.4f}")
+
+        # ----------------------------
+        # PRINT MASK STATISTICS
+        # ----------------------------
+        print("\n📊 Mask Statistics:")
+        print(f"   Mean(mask)       : {np.mean(mask_stats['mean']):.4f}")
+        print(f"   Std(mask)        : {np.mean(mask_stats['std']):.4f}")
+        print(f"   Min(mask)        : {np.mean(mask_stats['min']):.4f}")
+        print(f"   Max(mask)        : {np.mean(mask_stats['max']):.4f}")
+        print(f"   Active % (>0.2)  : {np.mean(mask_stats['active_pct']):.4f}")
+        print(f"   Angular variance : {np.mean(mask_stats['angular_var']):.4f}")
+
+        if len(mask_stats["mask_distance"]) > 0:
+            print(f"   Mask distance(mean abs diff) : {np.mean(mask_stats['mask_distance']):.6f}")
+
+        print()
+
+        return mean_test_loss
+
+
