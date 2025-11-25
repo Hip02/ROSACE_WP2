@@ -9,7 +9,7 @@ import os
 import random
 import math
 from datetime import datetime
-from networks.architectures.network_1 import CMESegNet, WeakCMECompositeLoss, WeakCMEUNet, CMELoss2
+from networks.architectures.network_1 import CMESegNet, WeakCMECompositeLoss, WeakCMEUNet, CMELossAngularProfileMSE, CMELossAngularProfileMSE_V2, CMELossAngularProfileMSE_V3, CMELossAngularProfileMSE_V4
 
 # ========================
 # 1. UTILITAIRES
@@ -46,38 +46,32 @@ def weak_collate(batch):
 # 2. CLASSE ENTRAÎNEMENT/TEST
 # ========================
 class Network:
-    def __init__(self, dataLoader, param=None, exp_name="Unnamed", device="cpu", batch_size=16, epochs=5):
+    def __init__(self, dataLoader, param={}, exp_name="Unnamed", device="cpu"):
         set_seed(42)
         self.dataLoader = dataLoader
         self.device = device
-        self.epochs = epochs
         self.results_path = "exp_list/" + exp_name
-        self.batchSize = batch_size
-        self.lr = param.get("lr", 1e-3) if param is not None else 1e-3
+        self.epochs = param.get("epochs", 5)
+        self.batchSize = param.get("batch_size", 16)
+        self.lr = param.get("lr", 1e-3)
         self.use_neighbors_diff = param.get("use_neighbor_diff", False) if param is not None else False
         
         create_folder(self.results_path)
 
-        # Data Loaders
-        self.dataSetTrain = LascoC2ImagesDataset(self.dataLoader, mode='train', param=param)
-        self.dataSetVal = LascoC2ImagesDataset(self.dataLoader, mode='val', param=param)
-        self.dataSetTest = LascoC2ImagesDataset(self.dataLoader, mode='test', param=param)
+        # Data Loader
+        self.dataSet = LascoC2ImagesDataset(self.dataLoader, param=param)
 
-        self.trainDataLoader = DataLoader(self.dataSetTrain, batch_size=self.batchSize, shuffle=True, collate_fn=weak_collate, num_workers=0)
-        self.valDataLoader = DataLoader(self.dataSetVal, batch_size=self.batchSize, shuffle=False, collate_fn=weak_collate, num_workers=0)
-        self.testDataLoader = DataLoader(self.dataSetTest, batch_size=self.batchSize, shuffle=False, collate_fn=weak_collate, num_workers=0)
+        self.dataLoader = DataLoader(self.dataSet, batch_size=self.batchSize, shuffle=True, collate_fn=weak_collate, num_workers=0)
 
         # Model + Optimizer + Loss
-
         self.in_channels = 5 if self.use_neighbors_diff else 1
 
         self.model = WeakCMEUNet(in_channels=self.in_channels).to(device)
-        self.criterion = CMELoss2().to(device)
-        #self.criterion = WeakCMECompositeLoss(n_bins=360, param=param).to(device)
+        self.criterion = CMELossAngularProfileMSE_V4().to(device)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
 
     def train(self):
-        train_losses, val_losses = [], []
+        train_losses = []
 
         for epoch in range(self.epochs):
             self.model.train()
@@ -111,23 +105,19 @@ class Network:
             mean_train_loss = running_loss / len(self.trainDataLoader.dataset)
             train_losses.append(mean_train_loss)
 
-            val_loss = self.validate()
-            val_losses.append(val_loss)
-
-            print(f"✅ Epoch {epoch+1} | Train Loss: {mean_train_loss:.4f} | Val Loss: {val_loss:.4f}")
+            print(f"✅ Epoch {epoch+1} | Train Loss: {mean_train_loss:.4f}")
 
         # Sauvegarde des poids
         create_folder(f"{self.results_path}/_Weights")
         torch.save(self.model.state_dict(), f"{self.results_path}/_Weights/model.pt")
 
-        # Sauvegarde des courbes
+        # Sauvegarde de la courbe
         plt.plot(train_losses, label='Train')
-        plt.plot(val_losses, label='Val')
         plt.legend()
-        plt.title("Learning curves")
+        plt.title("Learning curve")
         plt.xlabel("Epoch")
         plt.ylabel("Loss")
-        plt.savefig(f"{self.results_path}/learning_curves.png")
+        plt.savefig(f"{self.results_path}/learning_curve.png")
         plt.close()
 
     def loadWeights(self, modelPath=None, filename="model.pt"):
@@ -156,21 +146,15 @@ class Network:
             print(f"⚠️ Erreur lors du chargement des poids: {e}")
     
 
-    def visualize_samples(self, n_samples=20, mode="train"):
+    def visualize_samples(self, n_samples=20):
         """
         Sauvegarde n_samples figures dans exp/data_visualize.
         Chaque figure contient les 5 images (t-1, t, t+1, Δ1, Δ2)
         avec les overlays CME comme dans les sanity checks.
         """
 
-        assert mode in ["train", "val", "test"]
-
         # Sélection dataset
-        dataset = {
-            "train": self.dataSetTrain,
-            "val": self.dataSetVal,
-            "test": self.dataSetTest,
-        }[mode]
+        dataset = self.dataSet
 
         # Dossier output
         out_dir = os.path.join(self.results_path, "data_visualize")
@@ -275,35 +259,6 @@ class Network:
             plt.close(fig)
 
 
-    def validate(self):
-        self.model.eval()
-        total_loss = 0
-
-        with torch.no_grad():
-            # barre de chargement validation
-            val_loader = tqdm(
-                self.valDataLoader,
-                desc="Validating",
-                colour="cyan"  # ou "magenta", "green", "#00FFFF", ...
-            )
-
-            for batch in val_loader:
-                X = batch["image"].to(self.device)
-                constraints_batch = batch["constraints"]
-
-                mask_pred = self.model(X)
-
-                loss, loss_dict = self.criterion(
-                    mask_pred,
-                    constraints_batch,
-                    X
-                )
-
-                total_loss += loss.item() * X.size(0)
-
-        return total_loss / len(self.valDataLoader.dataset)
-
-
     def test(self, n_samples=16, save_vis=True, n_inspect=3):
         """
         Test weak-supervised segmentation model on polaire LASCO images.
@@ -338,7 +293,7 @@ class Network:
         # Collect n_samples from test set
         # ----------------------------
         samples = []
-        for i, batch in enumerate(self.testDataLoader):
+        for i, batch in enumerate(self.dataLoader):
             for j in range(batch["image"].size(0)):
                 samples.append({
                     "image": batch["image"][j:j+1],           # [1,1,R,Θ]
@@ -371,7 +326,7 @@ class Network:
                 target = self.criterion.build_target(constraints[0], device="cpu").numpy()
 
                 # ----------------------------
-                # 💠 MASK STATISTICS
+                # MASK STATISTICS
                 # ----------------------------
                 mask_stats["mean"].append(mask_np.mean())
                 mask_stats["std"].append(mask_np.std())

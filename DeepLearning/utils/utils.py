@@ -28,18 +28,15 @@ class LascoC2ImagesDataset(Dataset):
     Divise le dataset en train / val / test de manière aléatoire mais reproductible.
     """
 
-    def __init__(self, dataloader, mode="train", param=None, 
-                 split_ratio=(0.8, 0.1, 0.1), seed=42):
-
-        assert mode in ["train", "val", "test"]
+    def __init__(self, dataloader, param=None, seed=42):
 
         self.root_dir = dataloader.get_root_dir()
         self.labels_file = dataloader.get_labels_file()
-        self.mode = mode
         self.param = param or {}
         self.polar_transform = self.param.get("polar_transform", False)
+        self.crop_polar_bottom = self.param.get("crop_polar_bottom", False)
         self.shuffle = self.param.get("shuffle", True)
-        self.subsampling_factor = param.get("subsampling_factor", 1) if param else 1
+        self.subsampling_factor = self.param.get("subsampling_factor", 1) if param else 1
         self.use_neighbor_diff = self.param.get("use_neighbor_diff", False)
 
         # -------------------------------------------------------
@@ -74,29 +71,15 @@ class LascoC2ImagesDataset(Dataset):
                                              key=lambda i: self.image_times[i])
 
         # -------------------------------------------------------
-        # 3) Split train/val/test (sur index mélangé si shuffle=True)
+        # 3) Shuffle & subsampling des indices
         # -------------------------------------------------------
         all_indices = list(range(len(self.image_paths)))
+
         if self.shuffle:
             random.shuffle(all_indices)
 
-        n_total = len(all_indices)
-        n_train = int(split_ratio[0] * n_total)
-        n_val = int(split_ratio[1] * n_total)
-
-        train_idx = all_indices[:n_train]
-        val_idx = all_indices[n_train:n_train+n_val]
-        test_idx = all_indices[n_train+n_val:]
-
-        if mode == "train":
-            self.data_indices = train_idx
-            ########## Subsampling si demandé ##########
-            self.data_indices = self.data_indices[::self.subsampling_factor]
-
-        elif mode == "val":
-            self.data_indices = val_idx
-        else:
-            self.data_indices = test_idx
+        self.data_indices = all_indices
+        self.data_indices = self.data_indices[::self.subsampling_factor]
 
 
     def _load_cme_intervals(self):
@@ -261,8 +244,19 @@ class LascoC2ImagesDataset(Dataset):
         image = Image.open(path).convert("L")
         image_np = np.array(image, dtype=np.float32) / 255.0
 
+        # 1) Polar transform (optional)
         if self.polar_transform:
             image_np = self._apply_polar_transform(image_np)
+        
+         # 2) Radial cropping (optional)
+        if self.crop_polar_bottom:
+            # crop_polar_bottom = fraction à retirer (ex: 0.22)
+            frac = 0.22
+            H = image_np.shape[0]
+            keep = int(H * (1.0 - frac))
+
+            # On garde uniquement les lignes du haut
+            image_np = image_np[:keep, :]
 
         return torch.tensor(image_np, dtype=torch.float32).unsqueeze(0)   # [1,H,W]
 

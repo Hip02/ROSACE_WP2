@@ -531,67 +531,63 @@ class WeakCMECompositeLoss(nn.Module):
         return L_total, logs
 
 
-class CMELoss2(nn.Module):
+class CMELossAngularProfileMSE(nn.Module):
     """
-    Circular angular loss using trigonometric embedding.
+    Very simple angular loss:
+        Loss = MSE( A_pred(theta) , T(theta) )
 
-    For each angular bin θ:
-      v_pred(θ)   = A_pred(θ) * [cosθ, sinθ]
-      v_target(θ) = T(θ)       * [cosθ, sinθ]
-
-    Loss = SmoothL1( v_pred , v_target )
-
-    This naturally respects circular geometry: no discontinuity at 0°/360°.
+    where:
+      A_pred(theta) = radial mean of mask prediction
+      T(theta)      = binary target profile derived from constraints
     """
 
     def __init__(self, n_bins=360, lambda_ang=1.0):
         super().__init__()
         self.n_bins = n_bins
         self.lambda_ang = lambda_ang
-        self.crit = nn.SmoothL1Loss()
-
-        # Precompute angles
-        theta_deg = torch.arange(n_bins)
-        theta_rad = theta_deg * torch.pi / 180
-        self.cos = torch.cos(theta_rad).unsqueeze(0)   # [1,Theta]
-        self.sin = torch.sin(theta_rad).unsqueeze(0)   # [1,Theta]
+        self.crit = nn.MSELoss()
 
     def build_target(self, constraints, device):
-        t = torch.zeros(self.n_bins, device=device)
+        """
+        Build a binary angular profile T(θ) from constraints.
+        """
+        T = torch.zeros(self.n_bins, device=device)
+
         for c in constraints:
             tmin = int(c["theta_min"]) % self.n_bins
             tmax = int(c["theta_max"]) % self.n_bins
+
             if tmin <= tmax:
-                t[tmin:tmax+1] = 1.0
-            else:
-                t[tmin:] = 1.0
-                t[:tmax+1] = 1.0
-        return t
+                T[tmin:tmax+1] = 1.0
+            else:  # wrap around 360° -> 0°
+                T[tmin:] = 1.0
+                T[:tmax+1] = 1.0
+
+        return T
 
     def forward(self, mask_pred, constraints_batch, images=None):
+        """
+        mask_pred : [B,1,R,Theta]
+        constraints_batch : list of lists of constraints
+        """
         B,_,R,Theta = mask_pred.shape
         device = mask_pred.device
-
-        cos = self.cos.to(device)  # [1,Theta]
-        sin = self.sin.to(device)
 
         total_loss = 0.0
         logs = {"ang": 0.0}
 
         for b in range(B):
-            mask = mask_pred[b,0]          # [R,Theta]
-            A = mask.mean(dim=0)           # angular profile [Theta]
+            mask = mask_pred[b,0]        # [R,Theta]
+            A = mask.mean(dim=0)         # Angular profile [Theta]
 
+            # Build target profile
             if len(constraints_batch[b]) > 0:
                 T = self.build_target(constraints_batch[b], device)
             else:
                 T = torch.zeros(Theta, device=device)
 
-            # Project onto circle
-            v_pred   = torch.stack([A * cos, A * sin], dim=0)     # [2,Theta]
-            v_target = torch.stack([T * cos, T * sin], dim=0)     # [2,Theta]
-
-            L_ang = self.crit(v_pred, v_target)
+            # Simple MSE between profiles
+            L_ang = self.crit(A, T)
 
             total_loss += self.lambda_ang * L_ang
             logs["ang"] += L_ang.item()
@@ -599,4 +595,411 @@ class CMELoss2(nn.Module):
         total_loss /= B
         logs = {k: v/B for k,v in logs.items()}
 
+        return total_loss, logs
+    
+
+class CMELossAngularProfileMSE_V2(nn.Module):
+    """
+    Angular MSE with:
+      - Gaussian soft target
+      - Weighted MSE (more error when far from CME)
+    """
+
+    def __init__(self, n_bins=360, lambda_ang=1.0, sigma=10.0, alpha_weight=2.0):
+        super().__init__()
+        self.n_bins = n_bins
+        self.lambda_ang = lambda_ang
+        self.sigma = sigma
+        self.alpha_weight = alpha_weight  # amplifie les erreurs loin de la cible
+
+    # ============ UTILITAIRES ============
+
+    def circular_distance(self, theta, center):
+        """Distance angulaire circulaire."""
+        return torch.minimum(
+            (theta - center).abs(),
+            360 - (theta - center).abs()
+        )
+
+    def gaussian_1D(self, theta, center, sigma):
+        """Gaussian circulaire."""
+        dist = self.circular_distance(theta, center)
+        return torch.exp(-0.5 * (dist / sigma) ** 2)
+
+    # ============ CIBLE GAUSSIENNE ============
+
+    def build_target(self, constraints, device):
+        """
+        Création d'un profil T(θ) fait de gaussiennes.
+        """
+        theta = torch.arange(self.n_bins, device=device).float()
+        T = torch.zeros(self.n_bins, device=device)
+
+        for c in constraints:
+            tmin = float(c["theta_min"])
+            tmax = float(c["theta_max"])
+
+            # centre approximatif
+            if tmin <= tmax:
+                center = 0.5 * (tmin + tmax)
+            else:
+                # wrap: e.g. 350 → 10
+                center = (tmin + (tmax + 360)) / 2.0
+                if center >= 360:
+                    center -= 360
+
+            # Gaussian lissée autour du centre
+            T += self.gaussian_1D(theta, center, self.sigma)
+
+        # Normalisation optionnelle (évite des pics si 2 CME)
+        T = torch.clamp(T, 0.0, 1.0)
+        return T
+
+    # ============ FORWARD ============
+
+    def forward(self, mask_pred, constraints_batch, images=None):
+        """
+        mask_pred: [B,1,R,Theta]
+        """
+        B, _, R, Theta = mask_pred.shape
+        device = mask_pred.device
+
+        total_loss = 0.0
+        logs = {"ang": 0.0}
+
+        # angles
+        theta = torch.arange(Theta, device=device).float()
+
+        for b in range(B):
+            mask = mask_pred[b, 0]             # [R,Theta]
+            A = mask.mean(dim=0)               # Profil angulaire
+
+            # ---- Build target ----
+            if len(constraints_batch[b]) > 0:
+                T = self.build_target(constraints_batch[b], device)
+            else:
+                T = torch.zeros(Theta, device=device)
+
+            # ---- Weighted MSE ----
+            # Poids angulaires = plus l'angle est loin du centre CME, plus w est grand
+            if len(constraints_batch[b]) > 0:
+                # compute a combined distance weight
+                w = torch.zeros_like(theta)
+                for c in constraints_batch[b]:
+                    center = float(c["theta_min"] + (c["theta_max"] - c["theta_min"]) % 360) / 2.0
+                    dist = self.circular_distance(theta, center)
+                    w = torch.maximum(w, dist)  # max dist to any CME center
+
+                # poids = 1 + alpha * (dist normalisée)
+                w = 1 + self.alpha_weight * (w / 180.0)
+            else:
+                w = torch.ones_like(theta)
+
+            # Weighted MSE
+            L_ang = ((A - T) ** 2 * w).mean()
+
+            total_loss += self.lambda_ang * L_ang
+            logs["ang"] += L_ang.item()
+
+        total_loss /= B
+        logs = {k: v / B for k, v in logs.items()}
+        return total_loss, logs
+    
+
+class CMELossAngularProfileMSE_V3(nn.Module):
+    """
+    Angular profile loss with:
+      - Gaussian soft targets
+      - Circular distance weighting
+      - Smoothness regularization (2nd derivative)
+      - Light convolution smoothing of A(theta)
+    """
+
+    def __init__(
+        self,
+        n_bins=360,
+        lambda_ang=1.0,
+        sigma_target=15.0,
+        alpha_weight=2.0,
+        lambda_smooth=0.1,
+    ):
+        super().__init__()
+        self.n_bins = n_bins
+        self.lambda_ang = lambda_ang
+        self.sigma_target = sigma_target    # sigma of Gaussian targets
+        self.alpha_weight = alpha_weight    # weight strength for distance
+        self.lambda_smooth = lambda_smooth  # strength of A'' regularization
+
+        # convolution kernel for smoothing (light)
+        k = torch.tensor([0.25, 0.5, 0.25], dtype=torch.float32)
+        self.register_buffer("kernel", k[None, None, :])  # shape [1,1,3]
+
+    # -------------------------------------------------------
+    # Utility: circular distance
+    # -------------------------------------------------------
+    def circ_dist(self, theta, center):
+        """returns circular angular distance |θ - μ| mod 360."""
+        diff = (theta - center).abs()
+        return torch.minimum(diff, 360 - diff)
+
+    # -------------------------------------------------------
+    # Gaussian target construction
+    # -------------------------------------------------------
+    def build_target(self, constraints, device):
+        theta = torch.arange(self.n_bins, device=device).float()
+        T = torch.zeros_like(theta)
+
+        for c in constraints:
+            tmin = float(c["theta_min"])
+            tmax = float(c["theta_max"])
+
+            # compute correct circular center
+            if tmax >= tmin:
+                center = 0.5 * (tmin + tmax)
+            else:
+                # wrap case (ex: 350 -> 10)
+                center = (tmin + (tmax + 360)) / 2.0
+                if center >= 360:
+                    center -= 360
+
+            # Gaussian around CME center
+            dist = self.circ_dist(theta, center)
+            T += torch.exp(-0.5 * (dist / self.sigma_target) ** 2)
+
+        # clamp in case of double CME
+        return torch.clamp(T, 0.0, 1.0)
+
+    # -------------------------------------------------------
+    # Smoothness regularization: || A''(theta) ||^2
+    # -------------------------------------------------------
+    def smoothness_penalty(self, A):
+        # circular second derivative
+        A_roll_f = torch.roll(A, -1)
+        A_roll_b = torch.roll(A, 1)
+        A_second = A_roll_f - 2 * A + A_roll_b
+        return (A_second ** 2).mean()
+
+    # -------------------------------------------------------
+    # Forward
+    # -------------------------------------------------------
+    def forward(self, mask_pred, constraints_batch, images=None):
+        """
+        mask_pred : [B,1,R,Theta]
+        """
+        B,_,R,Theta = mask_pred.shape
+        device = mask_pred.device
+        theta = torch.arange(Theta, device=device).float()
+
+        total_loss = 0.0
+        logs = {"ang": 0.0, "smooth": 0.0}
+
+        for b in range(B):
+            # Angular profile
+            mask = mask_pred[b,0]       # [R,Theta]
+            A = mask.mean(dim=0)        # [Theta]
+
+            # Light smoothing of A(theta)
+            A_smooth = F.conv1d(
+                A[None,None,:], 
+                self.kernel, 
+                padding=1
+            )[0,0]
+
+            # Build target T(theta)
+            if len(constraints_batch[b]) > 0:
+                T = self.build_target(constraints_batch[b], device)
+            else:
+                T = torch.zeros(Theta, device=device)
+
+            # -------------------------------------------------------
+            # Distance-based weight: small near CME, large far away
+            # -------------------------------------------------------
+            if len(constraints_batch[b]) > 0:
+                dmin = None
+                for c in constraints_batch[b]:
+                    # compute correct center
+                    tmin = float(c["theta_min"])
+                    tmax = float(c["theta_max"])
+                    if tmax >= tmin:
+                        center = 0.5 * (tmin + tmax)
+                    else:
+                        center = (tmin + (tmax + 360)) / 2.0
+                        if center >= 360: center -= 360
+
+                    dist = self.circ_dist(theta, center)
+                    dmin = dist if dmin is None else torch.minimum(dmin, dist)
+
+                # weights: w = 1 + alpha * (dist normalized)
+                w = 1 + self.alpha_weight * (dmin / 180.0)
+            else:
+                w = torch.ones_like(theta)
+
+            # -------------------------------------------------------
+            # Weighted MSE
+            # -------------------------------------------------------
+            mse = w * (A_smooth - T) ** 2
+            L_ang = mse.mean()
+
+            # -------------------------------------------------------
+            # Smoothness regularisation
+            # -------------------------------------------------------
+            L_smooth = self.smoothness_penalty(A_smooth)
+
+            total_loss += self.lambda_ang * L_ang + self.lambda_smooth * L_smooth
+            logs["ang"] += L_ang.item()
+            logs["smooth"] += L_smooth.item()
+
+        total_loss /= B
+        logs = {k: v/B for k,v in logs.items()}
+        return total_loss, logs
+    
+
+class CMELossAngularProfileMSE_V4(nn.Module):
+    """
+    Angular profile loss with:
+      - Gaussian soft targets (circular)
+      - Angular smoothing of A(theta)
+      - CME-distance weighting (far from CME -> stronger correction)
+      - Error-distance weighting (large |A-T| -> stronger correction)
+      - Angular smoothness regularization (second derivative)
+    """
+
+    def __init__(
+        self,
+        n_bins=360,
+        lambda_ang=1.0,
+        sigma_target=12.0,     # largeur des gaussiennes CME
+        alpha_cme=2.0,         # poids distance à la CME
+        alpha_error=3.0,       # poids distance erreur |A-T|
+        lambda_smooth=0.05,    # régularisation smoothness
+    ):
+        super().__init__()
+        self.n_bins = n_bins
+        self.lambda_ang = lambda_ang
+        self.sigma_target = sigma_target
+        self.alpha_cme = alpha_cme
+        self.alpha_error = alpha_error
+        self.lambda_smooth = lambda_smooth
+
+        # petit kernel de lissage angulaire
+        kernel = torch.tensor([0.25, 0.5, 0.25], dtype=torch.float32)
+        self.register_buffer("kernel", kernel[None,None,:])  # shape [1,1,3]
+
+    # ------------------------------------------------------------------
+    # Circular distance between angles
+    # ------------------------------------------------------------------
+    def circ_dist(self, theta, center):
+        diff = (theta - center).abs()
+        return torch.minimum(diff, 360 - diff)
+
+    # ------------------------------------------------------------------
+    # Build soft Gaussian target for 1 sample
+    # ------------------------------------------------------------------
+    def build_target(self, constraints, device):
+        theta = torch.arange(self.n_bins, device=device).float()
+        T = torch.zeros_like(theta)
+
+        for c in constraints:
+            tmin = float(c["theta_min"])
+            tmax = float(c["theta_max"])
+
+            # center of CME interval (circular)
+            if tmax >= tmin:
+                center = (tmin + tmax) / 2
+            else:
+                # wrap example: 350 → 10
+                center = (tmin + (tmax + 360)) / 2
+                if center >= 360:
+                    center -= 360
+
+            dist = self.circ_dist(theta, center)
+            T += torch.exp(-0.5 * (dist / self.sigma_target)**2)
+
+        return torch.clamp(T, 0.0, 1.0)
+
+    # ------------------------------------------------------------------
+    # Angular smoothness regularization (second derivative)
+    # ------------------------------------------------------------------
+    def smoothness_penalty(self, A):
+        A_f = torch.roll(A, -1)
+        A_b = torch.roll(A, 1)
+        A_second = A_f - 2 * A + A_b
+        return (A_second**2).mean()
+
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
+    def forward(self, mask_pred, constraints_batch, images=None):
+        """
+        mask_pred : [B,1,R,Theta]
+        """
+        B,_,R,Theta = mask_pred.shape
+        device = mask_pred.device
+        theta = torch.arange(Theta, device=device).float()
+
+        total_loss = 0.
+        logs = {"ang": 0., "smooth": 0.}
+
+        for b in range(B):
+            mask = mask_pred[b,0]       # [R,Theta]
+            A = mask.mean(dim=0)        # profil angulaire brut
+
+            # petit lissage pour briser le sawtooth
+            A_smooth = F.conv1d(
+                A[None,None,:],
+                self.kernel,
+                padding=1
+            )[0,0]
+
+            # ---- Build soft target ----
+            if len(constraints_batch[b]) > 0:
+                T = self.build_target(constraints_batch[b], device)
+            else:
+                T = torch.zeros(Theta, device=device)
+
+            # ----------------------------------------------------------
+            # CME-distance weighting: small near CME, large far
+            # ----------------------------------------------------------
+            if len(constraints_batch[b]) > 0:
+                dmin = None
+                for c in constraints_batch[b]:
+                    tmin = float(c["theta_min"])
+                    tmax = float(c["theta_max"])
+
+                    # center
+                    if tmax >= tmin:
+                        center = (tmin + tmax) / 2
+                    else:
+                        center = (tmin + (tmax + 360)) / 2
+                        if center >= 360:
+                            center -= 360
+
+                    dist = self.circ_dist(theta, center)
+                    dmin = dist if dmin is None else torch.minimum(dmin, dist)
+
+                W_cme = 1 + self.alpha_cme * (dmin / 180.0)
+            else:
+                W_cme = torch.ones_like(theta)
+
+            # ----------------------------------------------------------
+            # Error-distance weighting: strong correction where A!=T
+            # ----------------------------------------------------------
+            D_err = torch.abs(A_smooth - T)
+            W_err = 1 + self.alpha_error * D_err
+
+            # Total weight
+            W = W_cme * W_err
+
+            # Weighted MSE
+            L_ang = (W * (A_smooth - T)**2).mean()
+
+            # Smoothness penalty
+            L_s = self.smoothness_penalty(A_smooth)
+
+            total_loss += self.lambda_ang * L_ang + self.lambda_smooth * L_s
+            logs["ang"] += L_ang.item()
+            logs["smooth"] += L_s.item()
+
+        total_loss /= B
+        logs = {k: v/B for k,v in logs.items()}
         return total_loss, logs
