@@ -12,6 +12,9 @@ wheels/
 # Dataset
 Dataset/
 
+# Results
+DeepLearning/results/
+
 # --- Données lourdes / modèles ---
 _Weights/
 *.h5
