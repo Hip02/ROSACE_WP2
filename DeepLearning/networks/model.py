@@ -50,7 +50,7 @@ class Network:
         set_seed(42)
         self.dataLoader = dataLoader
         self.device = device
-        self.results_path = "exp_list/" + exp_name
+        self.results_path = "results/exps/" + exp_name
         self.epochs = param.get("epochs", 5)
         self.batchSize = param.get("batch_size", 16)
         self.lr = param.get("lr", 1e-3)
@@ -77,7 +77,7 @@ class Network:
             self.model.train()
             running_loss = 0.0
 
-            for batch in tqdm(self.trainDataLoader, desc=f"Epoch {epoch+1}/{self.epochs}"):
+            for batch in tqdm(self.dataLoader, desc=f"Epoch {epoch+1}/{self.epochs}"):
 
                 # Batch extraction
                 X = batch["image"].to(self.device)             # [B,1,R,Theta]
@@ -102,7 +102,7 @@ class Network:
                 running_loss += loss.item() * X.size(0)
 
 
-            mean_train_loss = running_loss / len(self.trainDataLoader.dataset)
+            mean_train_loss = running_loss / len(self.dataLoader.dataset)
             train_losses.append(mean_train_loss)
 
             print(f"✅ Epoch {epoch+1} | Train Loss: {mean_train_loss:.4f}")
@@ -259,44 +259,45 @@ class Network:
             plt.close(fig)
 
 
-    def test(self, n_samples=16, save_vis=True, n_inspect=3):
+    def test(self, n_samples=16, save_vis=True, n_inspect=3, save_pred_masks=True, n_save_masks=8):
         """
         Test weak-supervised segmentation model on polaire LASCO images.
 
-        Includes:
-        - visualizations
-        - mask statistics (collapse detection)
+        NEW:
+        - Save 'n_save_masks' predicted masks into:
+            results/exps/<exp_name>/predicted_masks/
+        for later gradient analysis.
         """
 
         self.model.eval()
         all_losses = []
 
-        # NEW: global mask stats
+        # NEW: mask prediction save directory
+        pred_save_dir = os.path.join(self.results_path, "predicted_masks")
+        if save_pred_masks:
+            os.makedirs(pred_save_dir, exist_ok=True)
+            saved_count = 0
+
+        # --- mask stats ---
         mask_stats = {
-            "mean": [],
-            "std": [],
-            "min": [],
-            "max": [],
-            "active_pct": [],
-            "angular_var": [],
-            "mask_distance": []   # L1 distance between successive masks
+            "mean": [], "std": [], "min": [], "max": [],
+            "active_pct": [], "angular_var": [], "mask_distance": []
         }
+        last_mask = None
 
-        last_mask = None  # for collapse detection
-
-        # Directory for visualizations
+        # --- visualization folder ---
         vis_dir = os.path.join(self.results_path, "visualizations")
         if save_vis:
             os.makedirs(vis_dir, exist_ok=True)
 
-        # ----------------------------
-        # Collect n_samples from test set
-        # ----------------------------
+        # -----------------------------------------------
+        # Collect samples (test=entire dataset here)
+        # -----------------------------------------------
         samples = []
         for i, batch in enumerate(self.dataLoader):
             for j in range(batch["image"].size(0)):
                 samples.append({
-                    "image": batch["image"][j:j+1],           # [1,1,R,Θ]
+                    "image": batch["image"][j:j+1],    # [1,1,R,Θ]
                     "constraints": batch["constraints"][j],
                     "time": batch["time"][j]
                 })
@@ -305,25 +306,38 @@ class Network:
             if len(samples) >= n_samples:
                 break
 
-        # ----------------------------
-        # Loop through collected samples
-        # ----------------------------
+        # -----------------------------------------------
+        # Run through collected samples
+        # -----------------------------------------------
         with torch.no_grad():
             for i, sample in enumerate(samples):
 
-                X = sample["image"].to(self.device)          # [1,1,R,Θ]
-                constraints = [sample["constraints"]]        # batch size 1
+                X = sample["image"].to(self.device)
+                constraints = [sample["constraints"]]  
 
-                # ---- Forward ----
+                # ---- forward ----
                 mask_pred = self.model(X)
                 loss, loss_dict = self.criterion(mask_pred, constraints, X)
                 all_losses.append(loss.item())
 
-                mask_np = mask_pred[0,0].cpu().numpy()       # [R,Θ]
+                mask_np = mask_pred[0,0].cpu().numpy()
 
-                # ---- Angular profile ----
-                A = mask_np.mean(axis=0)                     # [Θ]
+                # ---- angular profile ----
+                A = mask_np.mean(axis=0)
                 target = self.criterion.build_target(constraints[0], device="cpu").numpy()
+
+                # ----------------------------
+                # NEW: SAVE PREDICTED MASK
+                # ----------------------------
+                if save_pred_masks and saved_count < n_save_masks:
+                    torch.save({
+                        "mask_pred": mask_pred[0,0].cpu(),      # [R,Θ]
+                        "constraints": constraints[0],           
+                        "image": sample["image"][0].cpu(),      # [1,R,Θ]
+                        "time": sample["time"]
+                    }, os.path.join(pred_save_dir, f"pred_{saved_count:03d}.pt"))
+
+                    saved_count += 1
 
                 # ----------------------------
                 # MASK STATISTICS
@@ -332,19 +346,11 @@ class Network:
                 mask_stats["std"].append(mask_np.std())
                 mask_stats["min"].append(mask_np.min())
                 mask_stats["max"].append(mask_np.max())
+                mask_stats["active_pct"].append((mask_np > 0.2).mean())
+                mask_stats["angular_var"].append(np.var(A))
 
-                # % pixels actifs (seuil arbitrary = 0.2)
-                active = (mask_np > 0.2).mean()
-                mask_stats["active_pct"].append(active)
-
-                # Angular variance (si très faible → collapse)
-                ang_var = np.var(A)
-                mask_stats["angular_var"].append(ang_var)
-
-                # Distance to previous mask (L1)
                 if last_mask is not None:
-                    dist = np.mean(np.abs(mask_np - last_mask))
-                    mask_stats["mask_distance"].append(dist)
+                    mask_stats["mask_distance"].append(np.mean(np.abs(last_mask - mask_np)))
                 last_mask = mask_np.copy()
 
                 # ----------------------------
@@ -353,15 +359,12 @@ class Network:
                 if i < n_inspect or save_vis:
                     fig, axs = plt.subplots(3, 1, figsize=(10, 10))
 
-                    # 1. Image polaire brute
                     axs[0].imshow(X[0,0].cpu(), cmap="gray", aspect="auto")
                     axs[0].set_title(f"Image polaire — {sample['time']}")
 
-                    # 2. Masque prédit
                     axs[1].imshow(mask_np, cmap="inferno", aspect="auto")
                     axs[1].set_title("Masque prédit")
 
-                    # 3. Profil angulaire
                     axs[2].plot(A, label="A(theta) prédiction")
                     axs[2].plot(target, label="target(theta)", linestyle="--")
                     axs[2].set_title("Profil angulaire (prédiction vs cible)")
@@ -369,24 +372,18 @@ class Network:
                     axs[2].legend()
 
                     plt.tight_layout()
-
                     if save_vis:
-                        fname = os.path.join(vis_dir, f"inspect_{i:03d}.png")
-                        fig.savefig(fname, dpi=150)
-
+                        fig.savefig(os.path.join(vis_dir, f"inspect_{i:03d}.png"), dpi=150)
                     plt.close(fig)
 
-        # ----------------------------
-        # Résultat global du test
-        # ----------------------------
+        # -----------------------------------------------
+        # Résultats globaux du test
+        # -----------------------------------------------
         mean_test_loss = np.mean(all_losses)
 
         print("\n🎯 Test terminé")
         print(f"   ➤ Test Loss = {mean_test_loss:.4f}")
 
-        # ----------------------------
-        # PRINT MASK STATISTICS
-        # ----------------------------
         print("\n📊 Mask Statistics:")
         print(f"   Mean(mask)       : {np.mean(mask_stats['mean']):.4f}")
         print(f"   Std(mask)        : {np.mean(mask_stats['std']):.4f}")
@@ -399,7 +396,7 @@ class Network:
             print(f"   Mask distance(mean abs diff) : {np.mean(mask_stats['mask_distance']):.6f}")
 
         print()
-
         return mean_test_loss
+
 
 

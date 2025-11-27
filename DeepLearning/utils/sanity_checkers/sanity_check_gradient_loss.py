@@ -52,6 +52,35 @@ def build_fake_mask(mask_type, H, W, device):
     else:
         raise ValueError(f"Unknown mask_type={mask_type}")
 
+# ============================================================
+# 1.b CHARGEMENT DE MASQUES RÉELS
+# ============================================================
+
+def load_real_masks(network, max_masks=6):
+    """
+    Charge quelques masques prédits depuis :
+        exp_list/<exp_name>/predicted_masks/*.pt
+    Retourne une liste de tuples :
+        (mask_tensor [1,1,R,W], constraints_batch)
+    """
+
+    pred_dir = os.path.join(network.results_path, "predicted_masks")
+    if not os.path.exists(pred_dir):
+        print("⚠ Aucun masque prédit trouvé. Lance d'abord test().")
+        return []
+
+    files = sorted([f for f in os.listdir(pred_dir) if f.endswith(".pt")])[:max_masks]
+    real_masks = []
+
+    for fname in files:
+        data = torch.load(os.path.join(pred_dir, fname))
+        mask = data["mask_pred"].unsqueeze(0).unsqueeze(0).to(network.device)   # [1,1,R,W]
+        constraints = [data["constraints"]]
+
+        real_masks.append((mask, constraints))
+
+    return real_masks
+
 
 # ============================================================
 # 2. GÉNÉRATION DES ENSEMBLES DE CONTRAINTES
@@ -226,15 +255,50 @@ def analyze_one(network, mask0, constraints_batch, output_dir, X):
 # 4. SANITY CHECK COMPLET
 # ============================================================
 
-def sanity_check_gradient_analysis(network, exp_name="sanity_gradient", H=360, W=360):
+def sanity_check_gradient_analysis(network, exp_name="sanity_gradient", H=360, W=360, use_real_masks=False):
 
     base_path = os.path.join("exp_list", exp_name)
     os.makedirs(base_path, exist_ok=True)
 
-    print("\n=== SANITY CHECK : MULTI-MASK × MULTI-CONSTRAINTS ===")
+    print("\n=== SANITY CHECK : GRADIENT ANALYSIS ===")
 
-    # Placeholder X (nécessaire pour la signature de ta loss)
+    # Placeholder X (structure compatible avec la loss)
     X = torch.zeros((1,5,H,W), device=network.device)
+
+    # ------------------------------------------------------------------
+    #  OPTION 1 : ANALYSE AVEC VRAIS MASQUES PRÉDITS
+    # ------------------------------------------------------------------
+    if use_real_masks:
+        print("\n➡ MODE: REAL MASKS")
+
+        real_masks = load_real_masks(network)
+
+        if len(real_masks) == 0:
+            print("❌ Aucun masque réel trouvé, fallback vers masques synthétiques.")
+        else:
+            out_dir = os.path.join(base_path, "real_masks")
+            os.makedirs(out_dir, exist_ok=True)
+
+            for k, (mask0, constraints_batch) in enumerate(real_masks):
+                print(f"   → Real mask {k}")
+                sample_dir = os.path.join(out_dir, f"sample_{k:03d}")
+                os.makedirs(sample_dir, exist_ok=True)
+
+                analyze_one(
+                    network=network,
+                    mask0=mask0,
+                    constraints_batch=constraints_batch,
+                    output_dir=sample_dir,
+                    X=X,
+                )
+
+            print("\n✔ Sanity-check sur masques réels terminé.")
+            return  # on s'arrête ici si use_real_masks=True
+
+    # ------------------------------------------------------------------
+    #  OPTION 2 : MODE SYNTHÉTIQUE (TA VERSION ACTUELLE)
+    # ------------------------------------------------------------------
+    print("\n➡ MODE: SYNTHETIC MASKS")
 
     mask_types = [
         "constant",

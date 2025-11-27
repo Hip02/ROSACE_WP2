@@ -8,6 +8,7 @@ from utils.sanity_checkers.sanity_check_polar import PolarTransformChecker
 from utils.sanity_checkers.sanity_check_head import CMEHeadChecker
 from utils.sanity_checkers.sanity_check_gradient_loss import sanity_check_gradient_analysis
 from utils.tools.cme_video_maker import CMEVideoMaker
+from utils.tools.cme_video_pred_maker import CMEVideoPredMaker
 from networks.model import Network
 
 dataset_path = "/Users/hippolytehilgers/Desktop/ROSACE/Project_ROSACE/WP2/Dataset/"
@@ -23,6 +24,15 @@ param = {
 
 dataLoader = MyDataLoader(root_dir=images_path, labels_file=labels_path, param=param)
 
-net = Network(dataLoader, exp_name="sanity_gradient_MSE_V4", param=param, device="mps")
+net = Network(dataLoader, exp_name="Loss_V4_test", param=param, device="mps")
 
-sanity_check_gradient_analysis(net, exp_name="sanity_gradient_MSE_V4")
+net.loadWeights()   
+
+videoMaker = CMEVideoPredMaker(
+    dataLoader=dataLoader,
+    DatasetClass=LascoC2ImagesDataset,
+    network=net.model,
+    device="mps"
+)
+
+videoMaker.make_video(year=2022, month=3, out_path="results/videos/cme_pred_2022_01.mp4", show_background=False)

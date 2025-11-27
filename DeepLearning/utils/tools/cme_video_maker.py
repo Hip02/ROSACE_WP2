@@ -73,13 +73,11 @@ class CMEVideoMaker:
 
         self.ds_cart = DatasetClass(
             dataloader=loader,
-            mode="train",
             param={"polar_transform": False, "shuffle": False}
         )
 
         self.ds_pol = DatasetClass(
             dataloader=loader,
-            mode="train",
             param={"polar_transform": True, "shuffle": False}
         )
 

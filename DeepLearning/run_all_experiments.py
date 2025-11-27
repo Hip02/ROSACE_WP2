@@ -11,14 +11,17 @@ labels_path = os.path.join(dataset_path, "cmes_lz_20220101_20221231.csv")
 experiment_list = [
     #("CMELoss2_test_1_frame", {"lr": 1e-3, "use_neighbor_diff": False}),
     #("CMELoss2_test_5_frames", {"lr": 1e-3, "use_neighbor_diff": True})
-    ("CropBottomTrue", {"crop_polar_bottom": True}),
-    ("CropBottomFalse", {"crop_polar_bottom": False})
+    #("CropBottomTrue", {"crop_polar_bottom": True}),
+    #("CropBottomFalse", {"crop_polar_bottom": False}),
+    ("Loss_V4_test", {"use_neighbor_diff": True}),
+    ("Loss_V4_no_neighbor_diff", {"use_neighbor_diff": False})
     ]
 
 # Constantes globales
 base_param = {
     "polar_transform": True,
-    "subsampling_factor": 10
+    "subsampling_factor": 5,
+    "epochs": 3
 }
 
 def run_all(device="mps"):

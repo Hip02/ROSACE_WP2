@@ -156,7 +156,13 @@ class LascoC2ImagesDataset(Dataset):
         constraints = []
 
         for cme in active_cmes:
-            pa = (cme["pa_deg"] - 90) % 360
+            # |───────────────────────────────────────────────────────────────|
+            # │ /!\  WARNING: Convention adjustment                           |
+            # │ This converts CACTus position angle (PA) to the warp_polar    |
+            # │ convention                                                    |
+            # |───────────────────────────────────────────────────────────────|
+            #pa = -(cme["pa_deg"]-90)%360  # Convention adjustment
+            pa = (-(cme["pa_deg"])-90)%360  # Convention adjustment
             da = cme["da_deg"]
 
             theta_min = (pa - da/2) % 360
@@ -189,10 +195,9 @@ class LascoC2ImagesDataset(Dataset):
             # |───────────────────────────────────────────────────────────────|
             # │ /!\  WARNING: Convention adjustment                           |
             # │ This converts CACTus position angle (PA) to the warp_polar    |
-            # │ convention where 0° points to the right. Keep this shift.     |
-            # │ to ensure angles align with the polar transform.              |
+            # │ convention                                                    |
             # |───────────────────────────────────────────────────────────────|
-            pa_deg = (pa_deg - 90) % 360
+            #pa_deg = pa_deg
 
 
             da_deg = match["da_deg"]
@@ -242,6 +247,12 @@ class LascoC2ImagesDataset(Dataset):
 
     def _load_polar_tensor(self, path):
         image = Image.open(path).convert("L")
+
+        #########################################################
+        # Align to CACTus convention (flip vertically)          #
+        image = image.transpose(method=Image.FLIP_TOP_BOTTOM)   #
+        #########################################################
+
         image_np = np.array(image, dtype=np.float32) / 255.0
 
         # 1) Polar transform (optional)
