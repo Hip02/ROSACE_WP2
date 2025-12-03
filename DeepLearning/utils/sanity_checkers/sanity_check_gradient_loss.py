@@ -2,7 +2,71 @@ import os
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.colors import Normalize
 
+
+# ============================================================
+# 0. FONCTION UTILITAIRE : CONSTRUCTION DU PROFIL CIBLE
+# ============================================================
+
+def build_target(n_bins, constraints, device, gaussian=False, sigma=10.0):
+    """
+    Build target angular profile T(theta) from CME constraints.
+
+    Args:
+        constraints : list of dicts containing theta_min, theta_max
+        gaussian    : if True → gaussian-smoothed target
+        sigma       : std of Gaussian (in degrees)
+    """
+    theta = torch.arange(n_bins, device=device).float()
+    T = torch.zeros(n_bins, device=device)
+
+    if not constraints:
+        return T
+
+    # -------------------------------
+    # BINARY TARGET (base version)
+    # -------------------------------
+    if gaussian is False:
+        for c in constraints:
+            tmin = int(c["theta_min"]) % n_bins
+            tmax = int(c["theta_max"]) % n_bins
+
+            if tmin <= tmax:
+                T[tmin:tmax+1] = 1.0
+            else:
+                T[tmin:] = 1.0
+                T[:tmax+1] = 1.0
+
+        return T
+
+    # ----------------------------------------------
+    # GAUSSIAN TARGET (smooth circular distribution)
+    # ----------------------------------------------
+    for c in constraints:
+        tmin = float(c["theta_min"]) % n_bins
+        tmax = float(c["theta_max"]) % n_bins
+
+        # Compute circular center
+        if tmin <= tmax:
+            center = 0.5 * (tmin + tmax)
+        else:
+            center = (tmin + (tmax + n_bins)) / 2.0
+            if center >= n_bins:
+                center -= n_bins
+
+        # Circular distance
+        dist = torch.minimum(
+            (theta - center).abs(),
+            n_bins - (theta - center).abs()
+        )
+
+        # Gaussian bump around the CME center
+        T += torch.exp(-0.5 * (dist / sigma) ** 2)
+
+    # Clamping to avoid >1 when multiple CME overlap
+    T = torch.clamp(T, 0.0, 1.0)
+    return T
 
 # ============================================================
 # 1. GÉNÉRATION DE FAUX MASQUES
@@ -136,7 +200,7 @@ def build_constraints_set(constraint_type):
 # 3. ANALYSE POUR UN MASQUE ET UNE CONTRAINTE
 # ============================================================
 
-def analyze_one(network, mask0, constraints_batch, output_dir, X):
+def analyze_one(network, param, mask0, constraints_batch, output_dir, X):
     """
     Calcule le gradient de la loss pour un masque et une contrainte.
     Génère toutes les figures, y compris les deux profils angulaires superposés.
@@ -158,21 +222,11 @@ def analyze_one(network, mask0, constraints_batch, output_dir, X):
     A_pred = mask_pred.detach().cpu().numpy()[0,0].mean(axis=0)  # [Theta]
 
     # ======= PROFIL ANGULAIRE TARGET =======
-    # • Même structure que dans ta loss
-    Theta = mask_pred.shape[-1]
-    if len(constraints_batch[0]) > 0:
-        T = torch.zeros(Theta, device=device)
-        for c in constraints_batch[0]:
-            tmin = int(c["theta_min"]) % Theta
-            tmax = int(c["theta_max"]) % Theta
-            if tmin <= tmax:
-                T[tmin:tmax+1] = 1.0
-            else:
-                T[tmin:] = 1.0
-                T[:tmax+1] = 1.0
-        A_target = T.detach().cpu().numpy()
-    else:
-        A_target = np.zeros(Theta, dtype=np.float32)
+    n_bins = mask0.shape[-1]
+    gaussian_target = param['loss_params'].get('gaussian_target', False)
+    sigma_target = param['loss_params'].get('sigma_target', 10.0)
+    A_target = build_target(n_bins, constraints_batch[0], device, gaussian=gaussian_target, sigma=sigma_target)
+    A_target = A_target.detach().cpu().numpy()  # [Theta]
 
     # ============================================================
     #   FIGURES EXISTANTES
@@ -185,8 +239,13 @@ def analyze_one(network, mask0, constraints_batch, output_dir, X):
     plt.savefig(os.path.join(output_dir, "mask.png"))
     plt.close()
 
+    
     plt.figure(figsize=(6,6))
-    plt.imshow(grad, cmap="bwr")
+
+    m = float(np.abs(grad).max())
+
+    plt.imshow(grad, cmap="bwr", norm=Normalize(vmin=-m, vmax=m))
+
     plt.title("Gradient")
     plt.colorbar()
     plt.savefig(os.path.join(output_dir, "grad_heatmap.png"))
@@ -255,9 +314,9 @@ def analyze_one(network, mask0, constraints_batch, output_dir, X):
 # 4. SANITY CHECK COMPLET
 # ============================================================
 
-def sanity_check_gradient_analysis(network, exp_name="sanity_gradient", H=360, W=360, use_real_masks=False):
+def sanity_check_gradient_analysis(network, exp_name, param, H=360, W=360, use_real_masks=False):
 
-    base_path = os.path.join("exp_list", exp_name)
+    base_path = network.results_path + f"/sanity_check_gradient_analysis_{exp_name}"
     os.makedirs(base_path, exist_ok=True)
 
     print("\n=== SANITY CHECK : GRADIENT ANALYSIS ===")
@@ -286,6 +345,7 @@ def sanity_check_gradient_analysis(network, exp_name="sanity_gradient", H=360, W
 
                 analyze_one(
                     network=network,
+                    param=param,
                     mask0=mask0,
                     constraints_batch=constraints_batch,
                     output_dir=sample_dir,
@@ -336,6 +396,7 @@ def sanity_check_gradient_analysis(network, exp_name="sanity_gradient", H=360, W
 
             analyze_one(
                 network=network,
+                param=param,
                 mask0=mask0,
                 constraints_batch=constraints_batch,
                 output_dir=c_dir,
