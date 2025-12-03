@@ -9,7 +9,7 @@ import os
 import random
 import math
 from datetime import datetime
-from networks.architectures.network_1 import CMESegNet, WeakCMECompositeLoss, WeakCMEUNet, CMELossAngularProfileMSE, CMELossAngularProfileMSE_V2, CMELossAngularProfileMSE_V3, CMELossAngularProfileMSE_V4
+from networks.factory import get_model, get_loss
 
 # ========================
 # 1. UTILITAIRES
@@ -66,8 +66,17 @@ class Network:
         # Model + Optimizer + Loss
         self.in_channels = 5 if self.use_neighbors_diff else 1
 
-        self.model = WeakCMEUNet(in_channels=self.in_channels).to(device)
-        self.criterion = CMELossAngularProfileMSE_V4().to(device)
+        model_name = param.get("model_name", "WeakCMEUNet")
+        loss_name = param.get("loss_name", "CMELossAngularProfileMSE_V4")
+        loss_params = param.get("loss_params", {})
+        model_params = param.get("model_params", {})
+
+        # Default model params
+        if "in_channels" not in model_params:
+             model_params["in_channels"] = self.in_channels
+
+        self.model = get_model(model_name, **model_params).to(device)
+        self.criterion = get_loss(loss_name, **loss_params).to(device)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
 
     def train(self):
@@ -87,6 +96,10 @@ class Network:
 
                 # Forward UNet
                 mask_pred = self.model(X)                   # mask_pred: [B,1,R,Theta]
+
+                # Handle cases where model output is tuple (e.g. CMESegNet)
+                if isinstance(mask_pred, tuple):
+                    mask_pred = mask_pred[0]
 
                 # Compute weak loss
                 loss, loss_dict = self.criterion(
@@ -317,6 +330,11 @@ class Network:
 
                 # ---- forward ----
                 mask_pred = self.model(X)
+
+                # Handle tuple return (e.g. CMESegNet)
+                if isinstance(mask_pred, tuple):
+                    mask_pred = mask_pred[0]
+
                 loss, loss_dict = self.criterion(mask_pred, constraints, X)
                 all_losses.append(loss.item())
 
@@ -397,6 +415,3 @@ class Network:
 
         print()
         return mean_test_loss
-
-
-

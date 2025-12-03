@@ -3,7 +3,7 @@ from networks.model import Network
 from utils.utils import MyDataLoader
 from utils.utils import LascoC2ImagesDataset
 
-dataset_path = "/Users/hippolytehilgers/Desktop/ROSACE/Project_ROSACE/WP2/Dataset/"
+dataset_path = "./Dataset"
 images_path = os.path.join(dataset_path, "data_lasco_c2_png")
 labels_path = os.path.join(dataset_path, "cmes_lz_20220101_20221231.csv")
 
@@ -24,7 +24,11 @@ base_param = {
     "epochs": 3
 }
 
+import torch
 def run_all(device="mps"):
+    if device == "mps" and not torch.backends.mps.is_available():
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
     for exp_name, options in experiment_list:
         print(f"\n==============================")
         print(f"🚀 Lancement de : {exp_name}")
