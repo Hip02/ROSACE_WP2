@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import matplotlib.pyplot as plt
 import numpy as np
-from networks.architectures.network_1 import CMEParamExtractor
+from networks.models.segnet import CMEParamExtractor
 
 
 # ===============================================================

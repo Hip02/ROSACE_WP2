@@ -1,0 +1,19 @@
+experiment:
+  name: "Loss_V4_test_yaml"
+parameters:
+  polar_transform: True
+  subsampling_factor: 10
+  use_neighbor_diff: True
+  epochs: 5
+  batch_size: 16
+  lr: 0.001
+  model_name: "WeakCMEUNet"
+  model_params:
+    in_channels: 5
+  loss_name: "CMELossAngularProfileMSE_V4"
+  loss_params:
+    lambda_ang: 1.0
+    sigma_target: 12.0
+    alpha_cme: 2.0
+    alpha_error: 3.0
+    lambda_smooth: 0.05
