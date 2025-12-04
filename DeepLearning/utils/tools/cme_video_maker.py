@@ -71,14 +71,20 @@ class CMEVideoMaker:
             param=None
         )
 
+        base_params = {
+            "neighbor_frames": 0,
+            "use_neighbor_diff": False,
+            "shuffle": False
+        }
+
         self.ds_cart = DatasetClass(
             dataloader=loader,
-            param={"polar_transform": False, "shuffle": False}
+            param={**base_params, "polar_transform": False}
         )
 
         self.ds_pol = DatasetClass(
             dataloader=loader,
-            param={"polar_transform": True, "shuffle": False}
+            param={**base_params, "polar_transform": True}
         )
 
         self.loader = loader
@@ -124,7 +130,8 @@ class CMEVideoMaker:
             # load cartesian (NOUVEAU FORMAT)
             # ---------------------------------------------------
             sample_cart = self.ds_cart[idx]
-            imgC = sample_cart["image"].squeeze().numpy()
+            center_idx = self.ds_cart.get_center_channel_index()
+            imgC = sample_cart["image"][center_idx].numpy()
             constraints = sample_cart["constraints"]  # LISTE dynamique
             dt = sample_cart["time"]
             dt_str = dt.strftime("%Y-%m-%d %H:%M")
@@ -135,7 +142,7 @@ class CMEVideoMaker:
             # load polar
             # ---------------------------------------------------
             sample_pol = self.ds_pol[idx]
-            imgP = sample_pol["image"].squeeze().numpy()
+            imgP = sample_pol["image"][self.ds_pol.get_center_channel_index()].numpy()
             Hp, Wp = imgP.shape
 
             # ---------------------------------------------------

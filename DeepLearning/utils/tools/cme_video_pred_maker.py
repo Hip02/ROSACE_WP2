@@ -80,16 +80,22 @@ class CMEVideoPredMaker:
         self.model = network.to(device)
         self.model.eval()
 
+        base_params = {}
+        if hasattr(dataLoader, "get_param"):
+            base_params = dataLoader.get_param()
+        elif hasattr(dataLoader, "param"):
+            base_params = dataLoader.param or {}
+
         # Dataset cartésien pour la vidéo
         self.ds_cart = DatasetClass(
             dataloader=dataLoader,
-            param={"polar_transform": False, "shuffle": False}
+            param={**base_params, "polar_transform": False, "shuffle": False}
         )
 
         # Dataset polaire pour la vidéo
         self.ds_pol = DatasetClass(
             dataloader=dataLoader,
-            param={"polar_transform": True, "shuffle": False}
+            param={**base_params, "polar_transform": True, "shuffle": False}
         )
 
         # IMPORTANT : garder dataLoader tel quel pour les mêmes stacks
@@ -141,23 +147,20 @@ class CMEVideoPredMaker:
 
             # -------------- CARTESIAN FRAME --------------
             sc = self.ds_cart[idx]
-            imgC = sc["image"].squeeze().numpy()
+            center_idx = self.ds_cart.get_center_channel_index()
+            imgC = sc["image"][center_idx].numpy()
             dt = sc["time"]
             dt_str = dt.strftime("%Y-%m-%d %H:%M")
             H, W = imgC.shape
 
-            # -------------- POLAR STACK (5 channels) -----
+            # -------------- POLAR STACK ------------------
             sp = self.ds_pol[idx]
-            imgP = sp["image"].to(self.device)  # <= [5,Hp,Wp] ou [1,Hp,Wp]
-            Hp, Wp = imgP.shape[-2:]
-
-            # Si 1 seul canal → répéter 5 fois pour correspondre au modèle
-            if imgP.shape[0] == 1:
-                imgP = imgP.repeat(5, 1, 1)
+            imgP_stack = sp["image"].to(self.device)  # <= [C,Hp,Wp]
+            Hp, Wp = imgP_stack.shape[-2:]
 
             # ---------- PREDICTION MODEL ----------
             with torch.no_grad():
-                pred = self.model(imgP.unsqueeze(0))  # [1,5,H,W] -> [1,1,H,W]
+                pred = self.model(imgP_stack.unsqueeze(0))  # [1,C,H,W] -> [1,1,H,W]
                 pred = torch.sigmoid(pred)
                 maskP = pred.squeeze().cpu().numpy()
 
@@ -183,7 +186,8 @@ class CMEVideoPredMaker:
             ax1.set_title(f"{dt_str}\nPred mask", fontsize=10)
             ax1.axis("off")
 
-            ax2.imshow(imgP.cpu().numpy()[0], cmap="gray",
+            imgP_vis = imgP_stack[self.ds_pol.get_center_channel_index()].cpu().numpy()
+            ax2.imshow(imgP_vis, cmap="gray",
                        extent=[0, 360, 0, 6], aspect="auto")
             ax2.imshow(maskP_vis, cmap="autumn", alpha=0.40,
                        extent=[0, 360, 0, 6], aspect="auto")

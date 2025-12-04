@@ -17,8 +17,8 @@ from networks.model import Network
 # ============================================================
 #               ON / OFF PARAMETERS
 # ============================================================
-DO_SANITY_CHECKS = True
-TRAIN_MODEL = False
+DO_SANITY_CHECKS = False
+TRAIN_MODEL = True
 TEST_MODEL = False
 MAKE_VIDEO = False
 # ============================================================

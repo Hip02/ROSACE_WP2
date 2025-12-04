@@ -74,47 +74,83 @@ def build_target(n_bins, constraints, device, gaussian=False, sigma=10.0):
 
 def build_fake_mask(mask_type, H, W, device):
     """
-    Génère divers masques pour tester la loss.
+    Génère des masques plus proches de situations CME courantes.
     """
-    if mask_type == "constant":
-        return torch.full((1,1,H,W), 0.5, device=device)
+    # Base canvas
+    zeros = torch.zeros((1, 1, H, W), device=device)
 
-    elif mask_type == "random":
-        return torch.rand((1,1,H,W), device=device)
+    if mask_type in ("empty", "constant"):
+        return zeros
 
-    elif mask_type == "horizontal_stripe":
-        m = np.zeros((H,W), dtype=np.float32)
-        m[H//3:2*H//3, :] = 1.0
+    if mask_type == "full_disk":
+        return torch.ones((1, 1, H, W), device=device)
+
+    if mask_type in ("single_sector", "gaussian_sector"):
+        m = np.zeros((H, W), dtype=np.float32)
+        # narrow sector around 150°
+        theta = np.linspace(0, 360, W, endpoint=False)
+        center = 150
+        width = 30
+        if mask_type == "gaussian_sector":
+            profile = np.exp(-0.5 * (((theta - center + 360) % 360) - 180) ** 2 / (width**2))
+            m += profile  # broadcast along H
+        else:
+            mask = (theta >= center - width / 2) & (theta <= center + width / 2)
+            m[:, mask] = 1.0
+        return torch.tensor(m).unsqueeze(0).unsqueeze(0).float().to(device)
+
+    if mask_type == "double_sector":
+        m = np.zeros((H, W), dtype=np.float32)
+        centers = [90, 260]
+        width = 40
+        theta = np.linspace(0, 360, W, endpoint=False)
+        for c in centers:
+            mask = (theta >= c - width / 2) & (theta <= c + width / 2)
+            m[:, mask] = 1.0
+        return torch.tensor(m).unsqueeze(0).unsqueeze(0).float().to(device)
+
+    if mask_type == "ring":
+        m = np.zeros((H, W), dtype=np.float32)
+        inner = int(0.35 * H)
+        outer = int(0.55 * H)
+        m[inner:outer, :] = 1.0
+        return torch.tensor(m).unsqueeze(0).unsqueeze(0).float().to(device)
+
+    if mask_type == "edge_flash":
+        m = np.zeros((H, W), dtype=np.float32)
+        m[:, -15:] = 1.0
+        m[:, :15] = 0.5  # wrap hint
+        return torch.tensor(m).unsqueeze(0).unsqueeze(0).float().to(device)
+
+    if mask_type == "noisy_cloud":
+        base = torch.rand((1, 1, H, W), device=device, dtype=torch.float32) * 0.2
+        blob = torch.zeros((H, W), dtype=torch.float32, device=device)
+        rr, cc = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing="ij")
+        center_r, center_c = H * 0.55, W * 0.3
+        blob[((rr - center_r) ** 2 + (cc - center_c) ** 2) < (0.12 * H) ** 2] = 0.8
+        return (base + blob.unsqueeze(0).unsqueeze(0)).clamp(0, 1)
+
+    # Backward compatibility with old names
+    if mask_type == "horizontal_stripe":
+        m = np.zeros((H, W), dtype=np.float32)
+        m[H // 3 : 2 * H // 3, :] = 1.0
         return torch.tensor(m).unsqueeze(0).unsqueeze(0).to(device)
-
-    elif mask_type == "vertical_stripe":
-        m = np.zeros((H,W), dtype=np.float32)
-        m[:, W//3:2*W//3] = 1.0
+    if mask_type == "vertical_stripe":
+        m = np.zeros((H, W), dtype=np.float32)
+        m[:, W // 3 : 2 * W // 3] = 1.0
         return torch.tensor(m).unsqueeze(0).unsqueeze(0).to(device)
+    if mask_type == "random":
+        return torch.rand((1, 1, H, W), device=device)
 
-    elif mask_type == "gaussian_angle":
-        theta = np.linspace(0, 2*np.pi, W)
-        profile = np.exp(-0.5*((theta - np.pi) / 0.3)**2)
-        m = np.tile(profile, (H,1))
-        return torch.tensor(m).unsqueeze(0).unsqueeze(0).float().to(device)
+    # Legacy names mapping to newer presets
+    if mask_type in ("gaussian_angle", "vertical_stripe"):
+        return build_fake_mask("single_sector", H, W, device)
+    if mask_type in ("circular_edge", "edge"):
+        return build_fake_mask("edge_flash", H, W, device)
+    if mask_type in ("sawtooth_angle", "radial_step", "horizontal_stripe"):
+        return build_fake_mask("ring", H, W, device)
 
-    elif mask_type == "circular_edge":
-        m = np.zeros((H,W), dtype=np.float32)
-        m[:, -10:] = 1.0
-        return torch.tensor(m).unsqueeze(0).unsqueeze(0).float().to(device)
-
-    elif mask_type == "sawtooth_angle":
-        saw = np.array([(i % 20) < 10 for i in range(W)], dtype=np.float32)
-        m = np.tile(saw, (H,1))
-        return torch.tensor(m).unsqueeze(0).unsqueeze(0).float().to(device)
-
-    elif mask_type == "radial_step":
-        m = np.zeros((H,W), dtype=np.float32)
-        m[:H//2, :] = 1.0
-        return torch.tensor(m).unsqueeze(0).unsqueeze(0).float().to(device)
-
-    else:
-        raise ValueError(f"Unknown mask_type={mask_type}")
+    raise ValueError(f"Unknown mask_type={mask_type}")
 
 # ============================================================
 # 1.b CHARGEMENT DE MASQUES RÉELS
@@ -361,14 +397,13 @@ def sanity_check_gradient_analysis(network, exp_name, param, H=360, W=360, use_r
     print("\n➡ MODE: SYNTHETIC MASKS")
 
     mask_types = [
-        "constant",
-        "random",
-        "horizontal_stripe",
-        "vertical_stripe",
-        "gaussian_angle",
-        "circular_edge",
-        "sawtooth_angle",
-        "radial_step",
+        "empty",
+        "full_disk",
+        "single_sector",
+        "double_sector",
+        "ring",
+        "edge_flash",
+        "noisy_cloud",
     ]
 
     constraint_types = [

@@ -1,16 +1,16 @@
 experiment:
-  name: "EMD_gaussian_target"
+  name: "EMD_binary_target"
 parameters:
   polar_transform: True
   subsampling_factor: 10
+  neighbor_frames: 3   # nombre d'images voisines de chaque côté
   use_neighbor_diff: True
   epochs: 5
   batch_size: 16
   lr: 0.001
   model_name: "WeakCMEUNet"
-  model_params:
-    in_channels: 5
+  model_params: {}
   loss_name: "CMELossAngularProfileWasserstein"
   loss_params:
-    gaussian_target: True
+    gaussian_target: False
     sigma_target: 10.0

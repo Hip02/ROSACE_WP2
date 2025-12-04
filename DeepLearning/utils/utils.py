@@ -20,6 +20,9 @@ class MyDataLoader:
     
     def get_labels_file(self):
         return self.labels_file
+
+    def get_param(self):
+        return self.param or {}
         
 
 class LascoC2ImagesDataset(Dataset):
@@ -33,6 +36,8 @@ class LascoC2ImagesDataset(Dataset):
         self.root_dir = dataloader.get_root_dir()
         self.labels_file = dataloader.get_labels_file()
         self.param = param or {}
+        self.neighbor_radius = max(0, int(self.param.get("neighbor_frames", 1)))
+        self.neighbor_offsets = list(range(-self.neighbor_radius, self.neighbor_radius + 1))
         self.polar_transform = self.param.get("polar_transform", False)
         self.crop_polar_bottom = self.param.get("crop_polar_bottom", False)
         self.shuffle = self.param.get("shuffle", True)
@@ -69,6 +74,7 @@ class LascoC2ImagesDataset(Dataset):
         # -------------------------------------------------------
         self.sorted_indices_by_time = sorted(range(len(self.image_paths)),
                                              key=lambda i: self.image_times[i])
+        self.index_to_sorted_pos = {idx: pos for pos, idx in enumerate(self.sorted_indices_by_time)}
 
         # -------------------------------------------------------
         # 3) Shuffle & subsampling des indices
@@ -274,6 +280,57 @@ class LascoC2ImagesDataset(Dataset):
     # =====================================================================
     #                               GETITEM
     # =====================================================================
+    def _get_neighbor_frame(self, sorted_pos, offset, reference_tensor):
+        """
+        Return the tensor for a neighbor at a given temporal offset.
+        If out of bounds, returns a zero tensor with the same shape as reference_tensor.
+        """
+        target_pos = sorted_pos + offset
+        if target_pos < 0 or target_pos >= len(self.sorted_indices_by_time):
+            return torch.zeros_like(reference_tensor)
+
+        neighbor_idx = self.sorted_indices_by_time[target_pos]
+        neighbor_path = self.image_paths[neighbor_idx]
+        return self._load_polar_tensor(neighbor_path)
+
+
+    def _offset_label(self, offset, prefix="t"):
+        """Format a human-readable label for a temporal offset."""
+        if offset == 0:
+            return prefix
+        sign = "-" if offset < 0 else "+"
+        return f"{prefix}{sign}{abs(offset)}"
+
+
+    def get_channel_names(self):
+        """
+        Returns the names of the channels produced by __getitem__ for visualization.
+        Order matches the stacking order.
+        """
+        names = [self._offset_label(o) for o in self.neighbor_offsets]
+        if self.use_neighbor_diff:
+            for o in self.neighbor_offsets:
+                if o == 0:
+                    continue
+                names.append(self._offset_label(o, prefix="Δ"))
+        return names
+
+
+    def get_num_channels(self):
+        """
+        Returns the number of channels in the image tensor output by __getitem__.
+        """
+        base_frames = len(self.neighbor_offsets)                  # neighbors + center
+        if self.use_neighbor_diff:
+            diff_frames = len(self.neighbor_offsets) - 1          # one per neighbor
+            return base_frames + diff_frames
+        return base_frames
+
+    def get_center_channel_index(self):
+        """Return the index of the central frame (offset 0) in the stacked tensor."""
+        return self.neighbor_offsets.index(0)
+
+
     def __getitem__(self, idx):
         # real index dans image_paths
         real_idx = self.data_indices[idx]
@@ -283,36 +340,36 @@ class LascoC2ImagesDataset(Dataset):
         I_t = self._load_polar_tensor(img_path)
 
         # -----------------------------------------------------
-        # Trouver t-1 et t+1 dans **la liste triée par temps**
+        # Trouver les voisins dans **la liste triée par temps**
         # -----------------------------------------------------
-        sorted_pos = self.sorted_indices_by_time.index(real_idx)
+        sorted_pos = self.index_to_sorted_pos[real_idx]
 
-        # voisin t-1
-        if sorted_pos > 0:
-            idx_prev = self.sorted_indices_by_time[sorted_pos - 1]
-            I_prev = self._load_polar_tensor(self.image_paths[idx_prev])
-        else:
-            I_prev = torch.zeros_like(I_t)
-
-        # voisin t+1
-        if sorted_pos < len(self.sorted_indices_by_time) - 1:
-            idx_next = self.sorted_indices_by_time[sorted_pos + 1]
-            I_next = self._load_polar_tensor(self.image_paths[idx_next])
-        else:
-            I_next = torch.zeros_like(I_t)
+        frames_by_offset = {0: I_t}
+        for offset in self.neighbor_offsets:
+            if offset == 0:
+                continue
+            frames_by_offset[offset] = self._get_neighbor_frame(sorted_pos, offset, I_t)
 
         # -----------------------------------------------------
         # Images différentielles
         # -----------------------------------------------------
-        dI_prev = I_t - I_prev
-        dI_next = I_next - I_t
-
+        frames = [frames_by_offset[o] for o in self.neighbor_offsets]
         if self.use_neighbor_diff:
-            # Stack final : [5,H,W]
-            img_stack = torch.cat([I_prev, I_t, I_next, dI_prev, dI_next], dim=0)
+            diffs = []
+            for offset in self.neighbor_offsets:
+                if offset == 0:
+                    continue
+                neighbor_frame = frames_by_offset[offset]
+                if offset < 0:
+                    diffs.append(I_t - neighbor_frame)
+                else:
+                    diffs.append(neighbor_frame - I_t)
+
+            # Stack final : [C,H,W] with frames then diffs
+            img_stack = torch.cat(frames + diffs, dim=0)
         else:
-            # Stack final : [1,H,W]
-            img_stack = I_t
+            # Stack final : [C,H,W] without differential channels
+            img_stack = torch.cat(frames, dim=0)
 
         # -----------------------------------------------------
         # Labels / constraints
@@ -328,4 +385,3 @@ class LascoC2ImagesDataset(Dataset):
             "constraints": constraints,  # liste dynamique selon CME actives
             "time": t_frame
         }
-

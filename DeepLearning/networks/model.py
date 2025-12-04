@@ -25,11 +25,7 @@ def create_folder(path: str):
 def weak_collate(batch):
     """
     batch = list of samples:
-        {
-            "image": Tensor[1,H,W],
-            "constraints": list[dict],
-            "time": datetime
-        }
+        { "image": Tensor[C,H,W], "constraints": list[dict], "time": datetime }
     """
     images = torch.stack([item["image"] for item in batch], dim=0)
     constraints = [item["constraints"] for item in batch]  # PAS empilé
@@ -55,6 +51,7 @@ class Network:
         self.batchSize = param.get("batch_size", 16)
         self.lr = param.get("lr", 1e-3)
         self.use_neighbors_diff = param.get("use_neighbor_diff", False) if param is not None else False
+        self.neighbor_radius = param.get("neighbor_frames", 1) if param is not None else 1
         
         create_folder(self.results_path)
 
@@ -64,16 +61,17 @@ class Network:
         self.dataLoader = DataLoader(self.dataSet, batch_size=self.batchSize, shuffle=True, collate_fn=weak_collate, num_workers=0)
 
         # Model + Optimizer + Loss
-        self.in_channels = 5 if self.use_neighbors_diff else 1
+        self.in_channels = self.dataSet.get_num_channels()
 
         model_name = param.get("model_name", "WeakCMEUNet")
         loss_name = param.get("loss_name", "CMELossAngularProfileMSE_V4")
         loss_params = param.get("loss_params", {})
-        model_params = param.get("model_params", {})
+        model_params = param.get("model_params", {}).copy()
 
-        # Default model params
-        if "in_channels" not in model_params:
-             model_params["in_channels"] = self.in_channels
+        # Force in_channels to follow dataloader output, warn if overwritten
+        if model_params.get("in_channels", self.in_channels) != self.in_channels:
+            print(f"⚠️  Overriding model in_channels to {self.in_channels} to match dataloader output.")
+        model_params["in_channels"] = self.in_channels
 
         self.model = get_model(model_name, **model_params).to(device)
         self.criterion = get_loss(loss_name, **loss_params).to(device)
@@ -162,7 +160,7 @@ class Network:
     def visualize_samples(self, n_samples=20):
         """
         Sauvegarde n_samples figures dans exp/data_visualize.
-        Chaque figure contient les 5 images (t-1, t, t+1, Δ1, Δ2)
+        Chaque figure contient toutes les cartes empilées (voisins + diff éventuels)
         avec les overlays CME comme dans les sanity checks.
         """
 
@@ -181,7 +179,7 @@ class Network:
         indices = rng.sample(range(len(dataset)), n_samples)
 
         # TITRES
-        channel_titles = ["t-1", "t", "t+1", "Δ1", "Δ2"]
+        channel_titles = self.dataSet.get_channel_names()
 
         for fig_id, idx in enumerate(indices):
 
@@ -208,16 +206,16 @@ class Network:
 
             # Créer figure
             fig, axes = plt.subplots(
-                1, 5,
-                figsize=(20, 4),
+                1, C,
+                figsize=(4 * C, 4),
                 squeeze=False
             )
             axes = axes[0]
 
             # ----------------------------------------------------
-            # AFFICHAGE des 5 IMAGES avec OVERLAY CME
+            # AFFICHAGE des IMAGES avec OVERLAY CME
             # ----------------------------------------------------
-            for k in range(5):
+            for k in range(C):
                 ax = axes[k]
                 img = img_stack[k].numpy()
 
@@ -244,7 +242,8 @@ class Network:
 
                     ax.imshow(overlay)
 
-                ax.set_title(channel_titles[k], fontsize=10, color=frame_color)
+                title = channel_titles[k] if k < len(channel_titles) else f"ch{k}"
+                ax.set_title(title, fontsize=10, color=frame_color)
                 ax.axis("off")
 
                 # Bordure
